@@ -1,4 +1,6 @@
 import json
+import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,9 +11,12 @@ from omegaconf import OmegaConf
 from Discriminator.scripts.baseline_pipeline_tracking import (
     PipelineTracker,
     parsed_csv_value,
+    wandb_tag,
     safe_name,
 )
-from Discriminator.scripts.run_baseline_pipeline import execute_pipeline, selected_stages
+from Discriminator.scripts.run_baseline_pipeline import (
+    execute_pipeline, pipeline_runs_dir, plot_input_paths, selected_stages,
+)
 
 
 def pipeline_config(root, stages):
@@ -42,6 +47,14 @@ def pipeline_config(root, stages):
 
 
 class BaselinePipelineTests(unittest.TestCase):
+    def test_plot_does_not_require_optional_discriminator_results(self):
+        cfg = pipeline_config(Path("/tmp"), ["plot"])
+        cfg.baseline.discriminator = {"enabled": True}
+        cfg.baseline.metrics = ["mean_bias", "scwd"]
+        paths = plot_input_paths(cfg, Path("/tmp/fixture"))
+        self.assertNotIn(Path("/tmp/fixture/data/discriminator_reverse_kl.csv"), paths)
+        self.assertNotIn(Path("/tmp/fixture/data/scwd_anchor_contributions.nc"), paths)
+
     def test_stages_are_validated_and_run_in_canonical_order(self):
         cfg = pipeline_config(Path("/tmp"), ["plot", "train_discriminators"])
         self.assertEqual(selected_stages(cfg), ["train_discriminators", "plot"])
@@ -73,11 +86,38 @@ class BaselinePipelineTests(unittest.TestCase):
             self.assertEqual(saved["selected_stages"], calls)
             self.assertTrue(Path(saved["resolved_config"]).is_file())
             self.assertEqual(Path(saved["run_dir"]), root / "runs" / "fixture-run")
+            self.assertIn("run_bytes", saved)
+            self.assertIn("storage_bytes_by_suffix", saved)
             self.assertEqual(
                 Path(str(cfg.baseline.output_dir)), root / "runs" / "fixture-run",
             )
             resolved = OmegaConf.load(manifest_path.parent / "resolved_config.yaml")
             self.assertEqual(Path(str(resolved.pipeline.runs_dir)), root / "runs")
+
+    def test_default_runs_dir_is_sibling_team_results(self):
+        cfg = pipeline_config(Path("/tmp"), [])
+        cfg.pipeline.runs_dir = None
+        cfg.data_dir = "/cluster/team/data"
+        self.assertEqual(
+            pipeline_runs_dir(cfg), Path("/cluster/team/baseline_pipeline_runs"),
+        )
+
+    def test_resume_skips_completed_stage_with_existing_outputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cfg = pipeline_config(root, ["evaluate_standard_metrics"])
+            output = root / "stage-output.csv"
+
+            def first_stage(*_args):
+                output.write_text("value\n1\n")
+                return [str(output)], []
+
+            with patch("Discriminator.scripts.run_baseline_pipeline.run_stage", first_stage):
+                execute_pipeline(cfg)
+            cfg.pipeline.resume = True
+            with patch("Discriminator.scripts.run_baseline_pipeline.run_stage") as resumed:
+                execute_pipeline(cfg)
+            resumed.assert_not_called()
 
     def test_existing_pipeline_id_requires_explicit_resume(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -110,9 +150,42 @@ class BaselinePipelineTests(unittest.TestCase):
             self.assertFalse(tracker.enabled)
             self.assertEqual(run.summary["example"], 1)
 
+    def test_online_wandb_working_tree_is_transient_and_environment_is_restored(self):
+        class FakeWandb:
+            @staticmethod
+            def login():
+                return True
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cfg = pipeline_config(root, [])
+            cfg.pipeline.wandb.enabled = True
+            cfg.pipeline.wandb.mode = "online"
+            cfg.pipeline.run_dir = str(root / "persistent-run")
+            cfg.pipeline.storage = {"online_wandb_transient": True}
+            environment = {
+                "PIPELINE_TRANSIENT_ROOT": str(root / "scratch"),
+                "WANDB_CACHE_DIR": "previous-cache",
+            }
+            with patch.dict(sys.modules, {"wandb": FakeWandb()}), patch.dict(os.environ, environment):
+                tracker = PipelineTracker(cfg, "fixture-run")
+                transient = root / "scratch" / "weather-discriminator-wandb" / f"fixture-run-{os.getpid()}"
+                self.assertEqual(tracker.wandb_parent, transient)
+                self.assertTrue(transient.is_dir())
+                self.assertEqual(os.environ["WANDB_CACHE_DIR"], str(transient / "cache"))
+                tracker.close()
+                self.assertFalse(transient.exists())
+                self.assertEqual(os.environ["WANDB_CACHE_DIR"], "previous-cache")
+                self.assertNotIn("WANDB_DATA_DIR", os.environ)
+
     def test_wandb_names_and_csv_values_are_stable(self):
         self.assertEqual(safe_name("train/GraphCast +6h"), "train-GraphCast-6h")
         self.assertEqual(parsed_csv_value("7"), 7)
+        long_tag = "pipeline:" + "descriptive-pipeline-name-" * 4
+        bounded = wandb_tag(long_tag)
+        self.assertEqual(len(bounded), 64)
+        self.assertEqual(bounded, wandb_tag(long_tag))
+        self.assertNotEqual(bounded, wandb_tag(long_tag + "different"))
         self.assertEqual(parsed_csv_value("0.25"), 0.25)
         self.assertIs(parsed_csv_value("false"), False)
         self.assertEqual(parsed_csv_value("GraphCast"), "GraphCast")
@@ -144,7 +217,9 @@ class BaselinePipelineTests(unittest.TestCase):
             with tracker.run("plotting", "plots", cfg):
                 pass
             self.assertEqual(fake_wandb.init_kwargs["name"], "fixture-run/plotting")
-            self.assertEqual(fake_wandb.init_kwargs["dir"], str(Path(cfg.pipeline.run_dir) / "wandb"))
+            self.assertEqual(fake_wandb.init_kwargs["dir"], str(Path(cfg.pipeline.run_dir)))
+            rows = (Path(cfg.pipeline.run_dir) / "wandb_runs.csv").read_text()
+            self.assertIn("fixture-run/plotting", rows)
 
 
 if __name__ == "__main__":

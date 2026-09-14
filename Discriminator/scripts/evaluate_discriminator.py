@@ -1,3 +1,4 @@
+"""Evaluate a trained discriminator and visualize spatial logit maps."""
 import os
 
 import cartopy.crs as ccrs

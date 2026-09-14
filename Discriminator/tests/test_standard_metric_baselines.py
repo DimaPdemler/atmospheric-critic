@@ -1,3 +1,4 @@
+import json
 import tempfile
 from unittest.mock import patch
 import unittest
@@ -20,27 +21,39 @@ from Discriminator.scripts.plot_standard_metric_baselines import (
     corruption_levels,
     corruption_max_severity,
     deranged_sample_positions,
+    fieldwise_deranged_sample_positions,
     display_metric_value,
     displayed_metric_name,
     evaluate_corruption_metrics,
+    finalize_global_mean_wasserstein,
+    fit_vissio_ulam_grid,
+    global_mean_wasserstein_diagnostic,
     representative_corruption_time_index,
+    gallery_logit_bin_edges,
+    repeated_diagnostic_labels,
     relative_corruption_coordinates,
     corruption_range_label,
     pairwise_sample_positions,
+    mmd_rbf_bandwidths,
+    mmd_rbf_distance,
+    null_diamond_positions,
     reference_features_from_config,
     scwd_anchor_diagnostic,
     scwd_anchor_transport_costs,
     scwd_anchor_area_weights,
     scwd_area_weighted_from_responses,
+    pointwise_moment_totals,
     plot_scwd_mean_response_differences,
     plot_scwd_anchor_diagnostics,
-    plot_scwd_top_w1_distributions,
+    plot_scwd_top_wasserstein_distributions,
     plot_discriminator_baselines,
     plot_normalized_corruption_metrics_by_type,
     plot_normalized_lead_metrics_by_model,
     plot_corruption_disturbances,
     plotted_metric_names,
     read_scwd_anchor_diagnostics,
+    read_global_mean_wasserstein_diagnostics,
+    standalone_metric_names,
     metric_normalization_scales,
     selected_distribution_metric_values,
     streaming_joint_features,
@@ -49,6 +62,7 @@ from Discriminator.scripts.plot_standard_metric_baselines import (
     vissio_global_mean_wasserstein,
     write_discriminator_baselines,
     write_scwd_anchor_diagnostics,
+    write_global_mean_wasserstein_diagnostics,
 )
 from Discriminator.scripts.temporal_holdout_utils import reconcile_checkpoint_variables
 
@@ -78,7 +92,9 @@ def baseline_test_config():
                 "scwd_radius_km": 4000.0,
                 "scwd_order": 2.0,
                 "scwd_quantiles": 10,
-                "scwd_channel_projections": 2,
+                "scwd_ot_samples": 6,
+                "scwd_ot_progress": False,
+                "scwd_top_wasserstein_anchors": 6,
                 "scwd_anchor_chunk_size": 4,
                 "corruption_seed": 11,
                 "corruption_steps": 3,
@@ -100,26 +116,80 @@ def synthetic_temperature_dataset():
     )
 
 
+class RepeatedPlotSelectionTest(unittest.TestCase):
+    def test_representative_mode_keeps_one_label_per_comparison_kind(self):
+        diagnostics = [
+            {"comparison_kind": "forecast", "label": "Pangu-Weather"},
+            {"comparison_kind": "forecast", "label": "GraphCast"},
+            {"comparison_kind": "corruption", "label": "grf"},
+            {"comparison_kind": "corruption", "label": "gaussian_blur"},
+            {"comparison_kind": "null", "label": "ERA5 null"},
+        ]
+        self.assertEqual(
+            repeated_diagnostic_labels(diagnostics, representative_only=True),
+            [
+                ("corruption", "gaussian_blur"),
+                ("forecast", "GraphCast"),
+                ("null", "ERA5 null"),
+            ],
+        )
+        self.assertEqual(len(repeated_diagnostic_labels(diagnostics)), 5)
+
+
 class FullStatisticsBaselineTest(unittest.TestCase):
+    def test_pointwise_moment_totals_do_not_apply_latitude_weights(self):
+        values = np.asarray([[[0.0, 0.0], [10.0, 10.0]]])
+        total, total_sq, count = pointwise_moment_totals(values)
+        self.assertEqual(count, 4.0)
+        self.assertEqual(total, 20.0)
+        self.assertEqual(total_sq, 200.0)
+
     def test_signed_moment_metrics_are_absolute_only_for_plotting(self):
         row = {"mean_bias": -3.5, "std_ratio_error": -0.25, "scwd": -1.5}
         self.assertEqual(display_metric_value(row, "mean_bias"), 3.5)
         self.assertEqual(display_metric_value(row, "std_ratio_error"), 0.25)
         self.assertEqual(display_metric_value(row, "scwd"), -1.5)
-        self.assertEqual(displayed_metric_name("mean_bias"), "|mean_bias|")
-        self.assertEqual(displayed_metric_name("std_ratio_error"), "|std_ratio_error|")
+        self.assertEqual(displayed_metric_name("mean_bias"), "|Mean bias|")
+        self.assertEqual(displayed_metric_name("std_ratio_error"), "|Std. ratio error|")
+        self.assertEqual(displayed_metric_name("mmd_rbf"), "RBF MMD")
+        self.assertEqual(displayed_metric_name("scwd"), "SCWD")
 
     def test_corruption_coordinates_span_one_per_native_range(self):
         blur = [{"severity": 0.0}, {"severity": 0.5}, {"severity": 1.0}]
         pixels = [{"severity": 0.0}, {"severity": 0.025}, {"severity": 0.05}]
         self.assertEqual(relative_corruption_coordinates(blur, "severity"), [0.0, 0.5, 1.0])
         self.assertEqual(relative_corruption_coordinates(pixels, "severity"), [0.0, 0.5, 1.0])
-        self.assertEqual(corruption_range_label("pixel_replace", pixels, "severity"), "pixel_replace [0, 0.05]")
+        self.assertEqual(corruption_range_label("pixel_replace", pixels, "severity"), "Pixel replace (0.05)")
 
     def test_evaluation_only_metrics_are_not_selected_for_standard_plots(self):
         metrics = ["mean_bias", "crps_like_field_energy", "sliced_wasserstein",
-                   "sliced_wasserstein_lon_corrected", "zonal_energy_spectrum_l2", "scwd"]
-        self.assertEqual(plotted_metric_names(metrics), ["mean_bias", "scwd"])
+                   "sliced_wasserstein_lon_corrected", "zonal_energy_spectrum_l2",
+                   "scwd_area_weighted", "scwd"]
+        self.assertEqual(plotted_metric_names(metrics), ["scwd"])
+        self.assertEqual(standalone_metric_names(metrics), ["mean_bias", "scwd"])
+
+    def test_mmd_fits_a_reference_bandwidth_per_field(self):
+        reference = np.asarray(
+            [[0.0, 0.0], [1.0, 100.0], [2.0, 200.0]], dtype=np.float64
+        )
+        bandwidths = mmd_rbf_bandwidths(reference, [(0, 1), (1, 2)])
+        np.testing.assert_allclose(bandwidths, [1.0, 100.0])
+
+    def test_per_field_mmd_remains_joint_across_fields(self):
+        reference = np.asarray(
+            [[-1.0, -1.0], [-0.5, -0.5], [0.5, 0.5], [1.0, 1.0]],
+            dtype=np.float64,
+        )
+        candidate = reference.copy()
+        candidate[:, 1] = candidate[::-1, 1]
+        cfg = OmegaConf.create({"baseline": {
+            "backend": "numpy",
+            "mmd_standardize": False,
+            "mmd_bandwidth_mode": "per_field",
+            "mmd_bandwidth": 0.5,
+        }})
+        score = mmd_rbf_distance(candidate, reference, cfg, [(0, 1), (1, 2)])
+        self.assertGreater(score, 0.1)
     def test_disturbance_gallery_renders_two_severity_rows(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -146,6 +216,24 @@ class FullStatisticsBaselineTest(unittest.TestCase):
 
 
 
+    def test_null_diamond_positions_dodge_left_of_zero(self):
+        positions = null_diamond_positions(5, 6.0)
+        np.testing.assert_allclose(positions, [-6.0, -4.5, -3.0, -1.5, 0.0])
+        self.assertEqual(len(np.unique(positions)), 5)
+
+    def test_era5_forecast_gallery_uses_original_logits_on_independent_axis(self):
+        panels = [
+            ("GraphCast", np.asarray([-4.0, 4.0]), [(6, np.asarray([-6.0, 6.0]))]),
+            ("Pangu-Weather", np.asarray([-2.0, 2.0]), [(6, np.asarray([-3.0, 3.0]))]),
+            ("ERA5 Forecast", np.asarray([-0.2, 0.2]), [(6, np.asarray([-0.3, 0.3]))]),
+        ]
+        common, by_model = gallery_logit_bin_edges(panels)
+        np.testing.assert_array_equal(by_model["GraphCast"], common)
+        np.testing.assert_array_equal(by_model["Pangu-Weather"], common)
+        self.assertAlmostEqual(float(by_model["ERA5 Forecast"][0]), -0.3)
+        self.assertAlmostEqual(float(by_model["ERA5 Forecast"][-1]), 0.3)
+        self.assertGreater(float(common[-1]), 5.0)
+
     def test_normalized_converse_plots_use_global_signed_metric_scales(self):
         metrics = ["positive", "mixed", "negative_only", "zero_only"]
         scale_rows = [
@@ -169,9 +257,23 @@ class FullStatisticsBaselineTest(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            plot_normalized_lead_metrics_by_model(lead_rows, metrics, ["T2M"], root)
+            discriminator_rows = [
+                {"architecture": "squeezenet", "kind": "forecast", "target": target,
+                 "x": 6.0, "score": score, "score_lower": score - 0.1,
+                 "score_upper": score + 0.1, "is_era5_test_null": False}
+                for target, score in (("Model A", 2.0), ("Model B", 1.0))
+            ]
+            plot_normalized_lead_metrics_by_model(
+                lead_rows, metrics, ["T2M"], root, discriminator_rows,
+            )
             plot_normalized_corruption_metrics_by_type(corruption_rows, metrics, ["T2M"], root)
             self.assertTrue((root / "plots" / "lead_time_by_model_normalized.png").is_file())
+            with np.load(root / "plots" / "lead_time_by_model_normalized.npz", allow_pickle=False) as bundle:
+                metadata = json.loads(str(bundle["metadata_json"]))
+            line_labels = {
+                line["label"] for axis in metadata["axes"] for line in axis["lines"]
+            }
+            self.assertIn("Learned critic", line_labels)
             self.assertTrue((root / "plots" / "corruption_by_type_normalized.png").is_file())
 
     def test_discriminator_outputs_are_separated_by_architecture(self):
@@ -209,7 +311,7 @@ class FullStatisticsBaselineTest(unittest.TestCase):
                 self.assertTrue((root / "plots" / "discriminator" / architecture / "lead_time_reverse_kl.png").exists())
                 self.assertTrue((root / "plots" / "discriminator" / architecture / "corruption_strength_reverse_kl.png").exists())
 
-    def test_structured_near_null_patterns_have_zero_mean_and_unit_area_rms(self):
+    def test_structured_near_null_patterns_have_expected_mean_and_unit_area_rms(self):
         latitudes = np.linspace(-90.0, 90.0, 9)
         weights = np.maximum(np.cos(np.deg2rad(latitudes)), 0.0)[:, None]
         denominator = np.sum(weights) * 16
@@ -217,12 +319,15 @@ class FullStatisticsBaselineTest(unittest.TestCase):
             "equatorial_checker_texture",
             "meridional_scanlines",
             "checkerboard_2px",
-            "zonal_scanlines",
         ):
             pattern = structured_near_null_pattern(name, latitudes, 16)
             self.assertAlmostEqual(float(np.sum(pattern * weights) / denominator), 0.0, places=6)
             rms = np.sqrt(np.sum(pattern**2 * weights) / denominator)
             self.assertAlmostEqual(float(rms), 1.0, places=6)
+        zonal = structured_near_null_pattern("zonal_scanlines", latitudes, 16)
+        self.assertAlmostEqual(float(np.mean(zonal)), 0.0, places=6)
+        zonal_rms = np.sqrt(np.sum(zonal**2 * weights) / denominator)
+        self.assertAlmostEqual(float(zonal_rms), 1.0, places=6)
 
     def test_hemisphere_splice_uses_severity_as_replacement_probability(self):
         cfg = baseline_test_config()
@@ -251,6 +356,31 @@ class FullStatisticsBaselineTest(unittest.TestCase):
         self.assertEqual(sorted(permutation.tolist()), list(range(8)))
         self.assertTrue(np.all(permutation != np.arange(8)))
 
+    def test_field_splice_replaces_whole_fields_from_independent_donors(self):
+        cfg = baseline_test_config()
+        cfg.baseline.corruption_severity_max = 0.05
+        latitudes = np.linspace(-75.0, 75.0, 7)
+        clean = np.zeros((3, 7, 8), dtype=np.float32)
+        donor = np.stack([np.full((7, 8), value, dtype=np.float32) for value in (1, 2, 3)])
+        full = apply_special_baseline_corruption(
+            clean, "field_splice", 0.05, latitudes, cfg, donor, random_seed=4,
+        )
+        np.testing.assert_array_equal(full, donor)
+        for seed in range(16):
+            partial = apply_special_baseline_corruption(
+                clean, "field_splice", 0.025, latitudes, cfg, donor, random_seed=seed,
+            )
+            for channel, value in enumerate((1, 2, 3)):
+                self.assertTrue(
+                    np.all(partial[channel] == 0.0) or np.all(partial[channel] == value)
+                )
+        permutations = fieldwise_deranged_sample_positions(8, 3, seed=3)
+        self.assertEqual(permutations.shape, (3, 8))
+        for permutation in permutations:
+            self.assertEqual(sorted(permutation.tolist()), list(range(8)))
+            self.assertTrue(np.all(permutation != np.arange(8)))
+        self.assertFalse(np.array_equal(permutations[0], permutations[1]))
+
     def test_streamed_corruption_metrics_include_all_new_families(self):
         cfg = baseline_test_config()
         cfg.monthly_split = {
@@ -271,6 +401,7 @@ class FullStatisticsBaselineTest(unittest.TestCase):
             "checkerboard_2px",
             "zonal_scanlines",
             "hemisphere_splice",
+            "field_splice",
         ]
         dataset = synthetic_temperature_dataset().assign_coords(time=pd.to_datetime([
             "2020-01-01T00", "2020-01-05T00", "2020-01-10T00", "2020-01-15T00",
@@ -280,10 +411,10 @@ class FullStatisticsBaselineTest(unittest.TestCase):
         variables = ["2m_temperature"]
         metrics = ["mean_bias", "scwd"]
         with tempfile.TemporaryDirectory() as temporary_dir:
-            rows, diagnostics = evaluate_corruption_metrics(
+            rows, diagnostics, global_mean_diagnostics = evaluate_corruption_metrics(
                 cfg, dataset, {}, variables, metrics, temporary_dir, return_scwd_diagnostics=True
             )
-        self.assertEqual(len(rows), 15)
+        self.assertEqual(len(rows), 3 * len(cfg.baseline.corruptions))
         self.assertEqual({row["corruption"] for row in rows}, set(cfg.baseline.corruptions))
         for name in cfg.baseline.corruptions:
             series = [row for row in rows if row["corruption"] == name]
@@ -423,48 +554,131 @@ class FullStatisticsBaselineTest(unittest.TestCase):
                 corrupted, clean, cfg, "fixture", 0, result["scwd"],
                 comparison_kind="corruption", severity=0.05,
             )
-            self.assertEqual(diagnostic["anchor_w1"].shape, (4, 8))
-            self.assertEqual(diagnostic["anchor_mean_response_difference"].shape, (4, 8))
+            null_diagnostic = scwd_anchor_diagnostic(
+                corrupted, clean, cfg, "ERA5 second-half null", 0, result["scwd"],
+                comparison_kind="null",
+            )
+            self.assertEqual(diagnostic["anchor_local_wasserstein"].shape, (4, 8))
+            self.assertEqual(diagnostic["anchor_mean_response_difference"].shape, (1, 4, 8))
             self.assertLess(np.max(np.abs(diagnostic["anchor_mean_response_difference"])), 2e-6)
-            top_w1 = diagnostic["top_w1_distributions"]
-            self.assertEqual(len(top_w1), 6)
-            self.assertTrue(np.all(np.diff([item["w1"] for item in top_w1]) <= 0.0))
+            top_wasserstein = diagnostic["top_wasserstein_distributions"]
+            self.assertEqual(len(top_wasserstein), 6)
+            self.assertTrue(np.all(np.diff([item["wasserstein"] for item in top_wasserstein]) <= 0.0))
             with tempfile.TemporaryDirectory() as output_dir:
                 output_root = Path(output_dir)
-                diagnostics = [diagnostic, corruption_diagnostic]
+                diagnostics = [diagnostic, corruption_diagnostic, null_diagnostic]
                 write_scwd_anchor_diagnostics(diagnostics, output_root)
                 loaded = read_scwd_anchor_diagnostics(output_root)
                 with patch("cartopy.mpl.geoaxes.GeoAxes.coastlines"), patch("cartopy.mpl.geoaxes.GeoAxes.add_feature"):
                     plot_scwd_anchor_diagnostics(diagnostics, output_root)
                     plot_scwd_mean_response_differences(diagnostics, output_root)
-                plot_scwd_top_w1_distributions(diagnostics, cfg, output_root)
+                plot_scwd_top_wasserstein_distributions(diagnostics, cfg, output_root)
                 with xr.open_dataset(output_root / "data" / "scwd_anchor_contributions.nc") as saved:
-                    self.assertEqual(saved.sizes["comparison"], 2)
+                    self.assertEqual(saved.sizes["comparison"], 3)
                     self.assertEqual(saved.sizes["anchor_latitude"], 4)
                     self.assertEqual(saved.sizes["anchor_longitude"], 8)
                     self.assertEqual(str(saved.label.values[0]), "Synthetic")
                     self.assertEqual(str(saved.comparison_kind.values[1]), "corruption")
                     self.assertAlmostEqual(float(saved.scwd.values[0]), result["scwd"], places=6)
-                    self.assertIn("anchor_w1", saved)
+                    self.assertIn("top_local_wasserstein", saved)
+                    self.assertEqual(int(saved.attrs["schema_version"]), 2)
                     self.assertIn("anchor_mean_response_difference", saved)
                     self.assertIn("candidate_response", saved)
-                self.assertEqual(len(loaded), 2)
+                self.assertEqual(len(loaded), 3)
                 self.assertEqual(loaded[1]["comparison_kind"], "corruption")
-                self.assertEqual(len(loaded[0]["top_w1_distributions"]), 6)
+                self.assertEqual(loaded[2]["comparison_kind"], "null")
+                self.assertEqual(len(loaded[0]["top_wasserstein_distributions"]), 6)
                 np.testing.assert_allclose(
-                    loaded[0]["top_w1_distributions"][0]["candidate"],
-                    diagnostic["top_w1_distributions"][0]["candidate"],
+                    loaded[0]["top_wasserstein_distributions"][0]["candidate"],
+                    diagnostic["top_wasserstein_distributions"][0]["candidate"],
                 )
                 self.assertTrue((output_root / "plots" / "scwd" / "Synthetic.png").is_file())
-                self.assertTrue((output_root / "plots" / "scwd" / "top_w1_distributions" / "Synthetic_006h.png").is_file())
+                self.assertTrue((output_root / "plots" / "scwd" / "top_wasserstein_distributions" / "Synthetic_006h.png").is_file())
                 self.assertTrue((output_root / "plots" / "scwd" / "Synthetic_mean_response_difference.png").is_file())
                 corruption_root = output_root / "plots" / "scwd" / "corruptions"
                 self.assertTrue((corruption_root / "fixture_severity_0.05.png").is_file())
                 self.assertTrue((corruption_root / "fixture_severity_0.05_mean_response_difference.png").is_file())
-                self.assertTrue((corruption_root / "top_w1_distributions" / "fixture_severity_0.05.png").is_file())
+                self.assertTrue((corruption_root / "top_wasserstein_distributions" / "fixture_severity_0.05.png").is_file())
+                null_root = output_root / "plots" / "scwd" / "null"
+                self.assertTrue((null_root / "ERA5_second-half_null.png").is_file())
+                self.assertTrue((null_root / "ERA5_second-half_null_mean_response_difference.png").is_file())
+                self.assertTrue((null_root / "top_wasserstein_distributions" / "ERA5_second-half_null.png").is_file())
 
             close_feature_memmaps(corrupted)
             close_feature_memmaps(clean)
+
+    def test_joint_gwd_detects_changed_cross_field_dependence(self):
+        reference = np.repeat([[-1.0, -1.0], [1.0, 1.0]], 20, axis=0)
+        candidate = np.repeat([[-1.0, 1.0], [1.0, -1.0]], 20, axis=0)
+        grid = fit_vissio_ulam_grid([reference, candidate], n_bins=20)
+        self.assertGreater(
+            vissio_global_mean_wasserstein(candidate, reference, n_bins=20, grid=grid),
+            0.0,
+        )
+        for field in range(2):
+            np.testing.assert_array_equal(
+                np.sort(candidate[:, field]), np.sort(reference[:, field])
+            )
+
+    def test_joint_scwd_uses_four_dimensional_euclidean_ground_cost(self):
+        cfg = baseline_test_config()
+        reference = {"scwd_responses": np.zeros((6, 4, 3), dtype=np.float32)}
+        shift = np.asarray([1.0, 2.0, -0.5, 0.25], dtype=np.float32)
+        candidate = {"scwd_responses": reference["scwd_responses"] + shift[None, :, None]}
+        costs = scwd_anchor_transport_costs(candidate, reference, cfg)
+        np.testing.assert_allclose(costs, np.sum(shift.astype(np.float64) ** 2))
+
+    def test_joint_scwd_unequal_inputs_sample_both_full_ranges(self):
+        cfg = baseline_test_config()
+        candidate_values = np.zeros((10, 2, 1), dtype=np.float32)
+        candidate_values[-1, :, 0] = 10.0
+        candidate = {"scwd_responses": candidate_values}
+        reference = {"scwd_responses": np.zeros((3, 2, 1), dtype=np.float32)}
+        costs = scwd_anchor_transport_costs(candidate, reference, cfg)
+        self.assertAlmostEqual(float(costs[0]), 200.0 / 3.0)
+
+    def test_joint_gwd_finalization_uses_one_shared_grid(self):
+        first_row, second_row = {}, {}
+        diagnostics = [
+            {"candidate": np.asarray([[0.0, 0.0], [1.0, 1.0]]),
+             "reference": np.asarray([[0.0, 0.0], [0.5, 0.5]]),
+             "row": first_row, "n_bins": 20},
+            {"candidate": np.asarray([[-3.0, 2.0], [4.0, 5.0]]),
+             "reference": np.asarray([[-1.0, 1.0], [2.0, 3.0]]),
+             "row": second_row, "n_bins": 20},
+        ]
+        grid = finalize_global_mean_wasserstein(diagnostics, baseline_test_config())
+        np.testing.assert_allclose(grid["lower"], [-3.0, 0.0])
+        np.testing.assert_allclose(grid["upper"], [4.0, 5.0])
+        self.assertIs(diagnostics[0]["grid"], diagnostics[1]["grid"])
+        self.assertIn("global_mean_wasserstein", first_row)
+        self.assertIn("global_mean_wasserstein", second_row)
+
+    def test_joint_gwd_artifact_round_trip_persists_grid_and_ulam_measures(self):
+        cfg = baseline_test_config()
+        row = {}
+        candidate = {"global_means": np.asarray([[0.0, 1.0], [2.0, 3.0]], dtype=np.float32)}
+        reference = {"global_means": np.asarray([[-1.0, 0.0], [1.0, 2.0]], dtype=np.float32)}
+        diagnostic = global_mean_wasserstein_diagnostic(
+            candidate, reference, cfg, "fixture", 6, row=row,
+        )
+        finalize_global_mean_wasserstein([diagnostic], cfg)
+        with tempfile.TemporaryDirectory() as output_dir:
+            output_root = Path(output_dir)
+            write_global_mean_wasserstein_diagnostics(
+                [diagnostic], ["temperature", "pressure"], output_root,
+            )
+            loaded = read_global_mean_wasserstein_diagnostics(output_root)
+            with xr.open_dataset(output_root / "data" / "global_mean_wasserstein_distributions.nc") as saved:
+                self.assertEqual(int(saved.attrs["schema_version"]), 2)
+                self.assertEqual(saved.attrs["estimator"], "joint_ulam_w2")
+                self.assertIn("candidate_ulam_mass", saved)
+                self.assertIn("reference_ulam_support", saved)
+                np.testing.assert_allclose(saved.ulam_lower.values, [-1.0, 0.0])
+                np.testing.assert_allclose(saved.ulam_upper.values, [2.0, 3.0])
+            self.assertEqual(len(loaded), 1)
+            np.testing.assert_allclose(loaded[0]["grid"]["lower"], [-1.0, 0.0])
+            self.assertAlmostEqual(loaded[0]["distance"], row["global_mean_wasserstein"])
 
     def test_vissio_global_mean_wasserstein_is_bounded_and_detects_shift(self):
         reference = np.linspace(-2.0, 2.0, 101)[:, None]

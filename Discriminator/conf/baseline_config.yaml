@@ -2,15 +2,80 @@ defaults:
   - config
   - _self_
 
+# PNG and numerical (.npz) plot data are always saved. PDFs can be large for
+# map galleries, so create them only for export-oriented runs.
+plotting:
+  save_pdf: false
+  profile: dashboard
+  # all: render every target-specific diagnostic; representative_only: for
+  # repeated single-target templates, render one representative per comparison
+  # kind. Combined/multi-target figures and galleries are always retained.
+  repeated_plot_mode: all
+  # Dense per-anchor SCWD response histograms are expensive and rarely needed.
+  # Anchor maps and mean-response-difference maps remain enabled.
+  scwd_response_histograms: false
+  paper:
+    # Replace this after reading TEXTWIDTH from the final neurips_2026 compile.
+    text_width_inches: 5.5
+    column_gap_inches: 0.12
+    # Full is appropriate for dense grids. Use half only for a selected simple
+    # curve included at approximately half the document line width.
+    width: full
+    # Optional filename or path globs used by the standalone paper renderer.
+    include: []
+  # Main 2x3 manuscript figure: five fixed-metric panels and one learned critic.
+  main_corruption_figure:
+    enabled: true
+    architecture: squeezenet
+    corruptions:
+      - gaussian_blur
+      - hf_noise
+      - checkerboard_2px
+      - hemisphere_splice
+      - field_splice
+    # Used in order when a requested critic was excluded by its validity check.
+    fallback_corruptions:
+      - hf_noise
+      - field_splice
+      - wind_patch_shuffle
+      - pixel_replace
+  # Compact appendix gallery: the five corruptions in the main comparison at
+  # identity, two interior points, and maximum configured strength. Per-corruption
+  # diagnostic galleries retain every evaluated severity.
+  corruption_gallery:
+    corruptions: ${plotting.main_corruption_figure.corruptions}
+    severity_count: 4
+
+  # One panel per manuscript forecast model, with all held-out lead-time logit
+  # distributions overlaid against the corresponding ERA5 test distribution.
+  logit_histogram_gallery:
+    enabled: true
+    architecture: squeezenet
+    resample_id: learned_04
+    individual_models: true
+    # Keep the preferred manuscript ordering, then append every other forecast
+    # target for which held-out per-sample logits are available.
+    include_all_available: true
+    models:
+      - GraphCast
+      - Pangu-Weather
+      - FuXi
+      - IFS HRES
+
 # Point-estimate distribution baselines aligned with the temporal-holdout
 # surface experiment. ERA5 paths, real-data time splits, lead times, and the
 # corruption severity scale are inherited from config.yaml.
 baseline:
   variables:
     - "2m_temperature"
+    - "10m_u_component_of_wind"
+    - "10m_v_component_of_wind"
+    - "mean_sea_level_pressure"
 
   # Per-model maximum coverage. Each forecast is evaluated only at configured
   # valid-time test days and paired to ERA5 at that exact timestamp.
+  # Disable for corruption-only standard-metric runs; the ERA5 null is retained.
+  evaluate_forecasts: true
   forecast_files:
     "GraphCast":
       - "${data_dir}/graphcast_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc"
@@ -22,6 +87,11 @@ baseline:
       - "${data_dir}/ifs_hres_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc"
     "ERA5 Forecast":
       - "${data_dir}/era5_forecast_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc"
+    # Evaluate one deterministic ensemble member; do not collapse the ensemble.
+    "UCast member 0":
+      - "${data_dir}/ucast2020_members/ucast-m0_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc"
+    "SWIFT":
+      - "${data_dir}/swift_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc"
 
   # Complete canonical corruption catalog. Wind-vector corruptions are skipped
   # automatically when the selected baseline fields do not contain U/V wind.
@@ -32,11 +102,10 @@ baseline:
     - "pixel_replace"
     - "wind_patch_shuffle"
     - "wind_rotation"
-    - "equatorial_checker_texture"
-    - "meridional_scanlines"
     - "checkerboard_2px"
     - "zonal_scanlines"
     - "hemisphere_splice"
+    - "field_splice"
   metrics:
     - "mean_bias"
     - "std_ratio_error"
@@ -48,7 +117,6 @@ baseline:
     - "global_mean_wasserstein"
     - "mmd_rbf"
     - "scwd"
-    - "scwd_area_weighted"
 
   output_dir: "${output_dir}/baselines/monthly_valid_time_2020/surface"
   # Use every timestamp in each configured range. The two quadratic metrics
@@ -84,6 +152,10 @@ baseline:
   # Vissio et al. use a 20-bin Ulam discretization for global-mean W2.
   global_mean_wd_bins: 20
   mmd_bandwidth: null
+  # Fit one ERA5-only median-heuristic length scale per field block while
+  # retaining a single joint product RBF kernel. Use joint_median to restore
+  # the legacy isotropic kernel over the complete concatenated state.
+  mmd_bandwidth_mode: per_field
   mmd_standardize: true
   # Optional leakage-free MMD diagnostic: fit a per-model/per-lead global
   # forecast-to-ERA5 mean/variance correction on train days, then freeze it on test days.
@@ -98,16 +170,20 @@ baseline:
   scwd_domain_lon_points: 720
   scwd_radius_km: 1000.0
   scwd_order: 2.0
+  # Scalar SCWD retains the paper quantile approximation. Multi-field SCWD
+  # uses exact empirical joint W2 over this deterministic sample budget.
   scwd_quantiles: 200
-  scwd_channel_projections: 16
+  scwd_ot_samples: 256
+  scwd_ot_progress: true
   scwd_anchor_chunk_size: 128
-  scwd_top_w1_anchors: 6
+  scwd_top_wasserstein_anchors: 6
   scwd_distribution_bins: 40
 
   corruption_steps: 7
   corruption_severity_max: 0.2
   corruption_severity_max_overrides:
-    # Blur severity is its native fraction of the full sigma=1.125-pixel kernel.
+    # Blur keeps severity 0 as identity; positive severities linearly span
+    # effective blur 0.2--1.0 (sigma 0.225--1.125 grid pixels).
     gaussian_blur: 1.0
     pixel_replace: 0.01
   # Companion maps show Corrupted − ERA5 for one representative timestamp from
@@ -116,7 +192,7 @@ baseline:
   corruption_visualization_time_index: null
   discriminator:
     enabled: true
-    checkpoint_dir: "${baseline.output_dir}/2m_temperature/models/target_discriminators"
+    checkpoint_dir: "${baseline.output_dir}/2m_temperature__10m_u_component_of_wind__10m_v_component_of_wind__mean_sea_level_pressure/models/target_discriminators"
     model_name: squeezenet
     attention_squeezenet:
       enabled: true
@@ -128,7 +204,7 @@ baseline:
       enabled: true
       repo_root: null
       weights_subdir: weights_4fields
-      target_variables: ["2m_temperature"]
+      target_variables: ${baseline.variables}
       use_era5_context_for_non_target_fields: false
       embedding_channels: 8
       embedding_resolution: [31, 60]

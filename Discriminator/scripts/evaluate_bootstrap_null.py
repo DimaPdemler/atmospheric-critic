@@ -29,9 +29,11 @@ from tqdm import tqdm
 try:
     from . import plot_standard_metric_baselines as P
     from .monthly_split import datetime_mask, time_ranges
+    from .fake_matching_apply import matching_mode
 except ImportError:
     import plot_standard_metric_baselines as P
     from monthly_split import datetime_mask, time_ranges
+    from fake_matching_apply import matching_mode
 
 
 # Everything the blind-spot figure plots (DEFAULT_METRICS minus
@@ -119,17 +121,20 @@ def per_sample_features(
         }
         donor_raw_by_variable = None
         if donor_positions is not None:
-            donor_indices = [
-                time_indices[int(donor_positions[position])]
-                for position in range(start, start + len(chunk_indices))
-            ]
-            donor_chunk = ds.isel(time=donor_indices)
-            donor_raw_by_variable = {
-                variable: np.asarray(
-                    donor_chunk[variable].transpose("time", "latitude", "longitude").values, dtype=np.float32
+            donor_raw_by_variable = {}
+            for channel, variable in enumerate(variables):
+                positions_for_field = (
+                    donor_positions if donor_positions.ndim == 1 else donor_positions[channel]
                 )
-                for variable in variables
-            }
+                donor_indices = [
+                    time_indices[int(positions_for_field[position])]
+                    for position in range(start, start + len(chunk_indices))
+                ]
+                donor_chunk = ds.isel(time=donor_indices)
+                donor_raw_by_variable[variable] = np.asarray(
+                    donor_chunk[variable].transpose("time", "latitude", "longitude").values,
+                    dtype=np.float32,
+                )
 
         valid_fields, valid_positions = [], []
         for local_idx, time_idx in enumerate(chunk_indices):
@@ -174,7 +179,7 @@ def per_sample_features(
         field_batch = np.stack(valid_fields)
         global_means.append(P.area_weighted_global_means(field_batch, latitudes))
         for sample_fields in field_batch:
-            moments.append(P.latitude_weighted_moment_totals(sample_fields[None], latitudes))
+            moments.append(P.pointwise_moment_totals(sample_fields[None]))
             spectra.append(np.concatenate([P.zonal_energy_spectrum(f, latitudes) for f in sample_fields]))
             vectors.append(np.concatenate([P.field_vector(f, latitudes, per_variable_pixels) for f in sample_fields]))
         if need_scwd:
@@ -194,6 +199,10 @@ def per_sample_features(
         ),
         "latitudes": latitudes,
         "longitudes": longitudes,
+        "mmd_field_slices": [
+            (field * per_variable_pixels, (field + 1) * per_variable_pixels)
+            for field in range(len(variables))
+        ],
         "positions": np.asarray(positions, dtype=int),
     }
 
@@ -215,6 +224,7 @@ def subset_features(pool, rows, pairwise_cap):
         "fields": np.empty((0, 0, 0), dtype=np.float32),
         "latitudes": pool["latitudes"],
         "longitudes": pool["longitudes"],
+        "mmd_field_slices": pool["mmd_field_slices"],
         "n_valid_samples": int(rows.size),
         "pairwise_n_samples": int(pair_rows.size),
     }
@@ -326,6 +336,8 @@ def bootstrap_null_output_dir(cfg, variables):
 def evaluate_bootstrap_null(cfg):
     """Resample the null, sweep the severity ladder; returns written paths."""
     variables = P.variables_from_config(cfg)
+    if matching_mode(cfg) != "none":
+        raise ValueError("Bootstrap null evaluation does not yet support fake-distribution matching.")
     metric_names = [m for m in TABLE_METRICS if m in set(P.metric_names_from_config(cfg))]
     replicates = int(bootstrap_get(cfg, "replicates", 200))
     pool_samples = int(bootstrap_get(cfg, "pool_samples", 3000))
@@ -497,10 +509,15 @@ def evaluate_bootstrap_null(cfg):
     ladder_progress = tqdm(total=len(ladder_work) * curve_replicates, desc="curve resamples")
     for corruption_type in corruption_types:
         levels = P.corruption_levels(corruption_type, cfg)
-        donor_positions = (
-            P.deranged_sample_positions(len(curve_indices), int(P.baseline_get(cfg, "corruption_seed", 0)))
-            if corruption_type == "hemisphere_splice" else None
-        )
+        donor_seed = int(P.baseline_get(cfg, "corruption_seed", 0))
+        if corruption_type == "hemisphere_splice":
+            donor_positions = P.deranged_sample_positions(len(curve_indices), donor_seed)
+        elif corruption_type == "field_splice":
+            donor_positions = P.fieldwise_deranged_sample_positions(
+                len(curve_indices), len(variables), donor_seed
+            )
+        else:
+            donor_positions = None
         for severity in levels:
             if float(severity) == 0.0:
                 # Self-comparison; identically zero, verified above.

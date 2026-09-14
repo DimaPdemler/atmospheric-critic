@@ -15,6 +15,19 @@ monthly_split:
     - ["2020-01-01", "2020-12-31"]
   require_exact_era5_match: true
 
+# Repeated within-month holdouts used for uncertainty estimates. Child runs
+# receive one active_schedule; leave it null in the parent invocation.
+temporal_resampling:
+  enabled: true
+  learned_replicates: 5
+  fixed_replicates: 10
+  learned_test_windows: [[5, 11], [9, 15], [13, 19], [17, 23], [20, 26]]
+  buffer_days: 4
+  random_test_start_range: [5, 20]
+  seed: 0
+  active_schedule: null
+  input_run_dir: null
+
 # ERA5/reference file used for training real samples.
 real_nc_file: "${data_dir}/era5_1.5deg_2004-01-01_2023-12-31.nc"
 
@@ -110,13 +123,11 @@ corruption_severity_max: 1.0
 # Severity sampler exponent. Values > 1 bias samples toward weaker corruptions.
 corruption_severity_power: 2.0
 
-# Lower bounds apply only to synthetic fake corruptions during training.  Clean
-# samples remain in the real class; Gaussian sigma below about 0.2 pixels is
-# numerically indistinguishable from identity, so blur fakes begin at 0.2.
+# Optional training-only logical-severity bounds. Gaussian blur itself maps any
+# positive logical severity onto its useful physical range while preserving an
+# exact identity at zero, so it needs no separate sampling floor here.
 corruption_severity_min: 0.0
-corruption_severity_min_overrides:
-  blur: 0.2
-  gaussian_blur: 0.2
+corruption_severity_min_overrides: {}
 
 # Optional fixed corruption override for targeted disturbance training/evaluation.
 # Leave null/0.0 for the random corruption policy.

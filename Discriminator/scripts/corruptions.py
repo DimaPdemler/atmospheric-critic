@@ -1,3 +1,5 @@
+"""Synthetic corruptions for the discriminator pipeline."""
+
 import torch
 import scipy.ndimage as ndimage
 import numpy as np
@@ -13,6 +15,8 @@ PAD_BOTTOM = 3
 PAD_LEFT = 8
 PAD_RIGHT = 8
 PADDED_SHAPE = (128, 256)
+GAUSSIAN_BLUR_SEVERITY_FLOOR = 0.2
+GAUSSIAN_BLUR_MAX_SIGMA_PIXELS = 1.125
 
 
 def get_corruption_ladder(corruption_type, n_steps=9):
@@ -63,14 +67,25 @@ def _preserve_spatial_mean(original, corrupted):
     return corrupted - residual.mean(dim=(-2, -1), keepdim=True)
 
 
+def gaussian_blur_effective_severity(severity):
+    """Map positive logical severity onto the useful physical blur range."""
+    severity = float(severity)
+    if severity <= 0.0:
+        return 0.0
+    return GAUSSIAN_BLUR_SEVERITY_FLOOR + (
+        1.0 - GAUSSIAN_BLUR_SEVERITY_FLOOR
+    ) * severity
+
+
 def apply_gaussian_blur(x, severity):
     """
     x: torch tensor of shape (N, C, H, W)
-    severity: float in [0, 1]. Maps to sigma in [0, 1.125].
+    severity: float in [0, 1]. Zero is identity; positive values linearly map
+        from effective severity 0.2 to 1.0 (sigma 0.225 to 1.125 pixels).
     """
     if severity <= 0:
         return x
-    sigma = severity * 1.125
+    sigma = gaussian_blur_effective_severity(severity) * GAUSSIAN_BLUR_MAX_SIGMA_PIXELS
     if _is_model_padded_shape(x):
         interior = _crop_interior(x)
         interior_np = interior.detach().cpu().numpy()

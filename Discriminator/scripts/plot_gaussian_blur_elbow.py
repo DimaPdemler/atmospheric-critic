@@ -10,11 +10,19 @@ import torch
 from omegaconf import DictConfig
 
 try:
-    from .corruptions import apply_gaussian_blur
+    from .corruptions import (
+        GAUSSIAN_BLUR_MAX_SIGMA_PIXELS,
+        apply_gaussian_blur,
+        gaussian_blur_effective_severity,
+    )
     from .monthly_split import select_era5_split
     from .train_discriminator import safe_open_dataset
 except ImportError:
-    from corruptions import apply_gaussian_blur
+    from corruptions import (
+        GAUSSIAN_BLUR_MAX_SIGMA_PIXELS,
+        apply_gaussian_blur,
+        gaussian_blur_effective_severity,
+    )
     from monthly_split import select_era5_split
     from train_discriminator import safe_open_dataset
 
@@ -94,8 +102,6 @@ def plot_rows(rows, output_path):
         axis.legend()
     axes[0].set_title("Absolute change in training-standardized units")
     axes[1].set_title("Relative spatial change")
-    top_axis = axes[0].secondary_xaxis("top", functions=(lambda value: 1.125 * value, lambda value: value / 1.125))
-    top_axis.set_xlabel("Gaussian $\\sigma$ (grid pixels)")
     figure.suptitle(
         f"Gaussian blur low-severity sweep (σ={sigma[0]:.3f}–{sigma[-1]:.3f} pixels)",
         y=1.03,
@@ -142,7 +148,10 @@ def run(cfg):
         absolute_q, relative_q = quantiles(absolute), quantiles(relative)
         rows.append({
             "severity": float(severity),
-            "sigma_pixels": float(severity * 1.125),
+            "sigma_pixels": float(
+                gaussian_blur_effective_severity(severity)
+                * GAUSSIAN_BLUR_MAX_SIGMA_PIXELS
+            ),
             "absolute_rms_p10": float(absolute_q[0]),
             "absolute_rms_p50": float(absolute_q[1]),
             "absolute_rms_p90": float(absolute_q[2]),

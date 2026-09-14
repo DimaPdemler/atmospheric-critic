@@ -2,6 +2,8 @@
 
 import csv
 import json
+import os
+import tempfile
 import time
 import traceback
 import uuid
@@ -13,7 +15,7 @@ from omegaconf import DictConfig, OmegaConf
 
 try:
     from .baseline_pipeline_tracking import PipelineTracker, safe_name
-    from .plot_bundles import plot_bundle_paths
+    from .plot_bundles import all_plot_bundle_paths, configure_plot_bundle_saving_from_cfg
     from .plot_standard_metric_baselines import (
         baseline_get,
         baseline_output_dir,
@@ -30,11 +32,16 @@ try:
     from .train_target_discriminator_baselines import (
         plot_target_discriminator_interpretability, train_target_discriminator_baselines,
     )
+    from .fit_histogram_matching import fit_histogram_matching_maps
+    from .fit_moment_matching import fit_moment_matching_maps
+    from .fake_matching_apply import matching_mode
     from .evaluate_bootstrap_null import bootstrap_null_output_dir, evaluate_bootstrap_null
     from .plot_bootstrap_blindspots import plot_bootstrap_blindspots
+    from .temporal_resampling import active_schedule, enabled as temporal_resampling_enabled
+    from .temporal_resampling_pipeline import finalize_resampling_manifest, run_resampled_stage
 except ImportError:
     from baseline_pipeline_tracking import PipelineTracker, safe_name
-    from plot_bundles import plot_bundle_paths
+    from plot_bundles import all_plot_bundle_paths, configure_plot_bundle_saving_from_cfg
     from plot_standard_metric_baselines import (
         baseline_get,
         baseline_output_dir,
@@ -51,11 +58,18 @@ except ImportError:
     from train_target_discriminator_baselines import (
         plot_target_discriminator_interpretability, train_target_discriminator_baselines,
     )
+    from fit_histogram_matching import fit_histogram_matching_maps
+    from fit_moment_matching import fit_moment_matching_maps
+    from fake_matching_apply import matching_mode
     from evaluate_bootstrap_null import bootstrap_null_output_dir, evaluate_bootstrap_null
     from plot_bootstrap_blindspots import plot_bootstrap_blindspots
+    from temporal_resampling import active_schedule, enabled as temporal_resampling_enabled
+    from temporal_resampling_pipeline import finalize_resampling_manifest, run_resampled_stage
 
 
 STAGES = (
+    "fit_histogram_matching",
+    "fit_moment_matching",
     "train_discriminators",
     "evaluate_standard_metrics",
     "evaluate_discriminator_metrics",
@@ -73,41 +87,115 @@ def generated_pipeline_id():
 
 
 def pipeline_runs_dir(cfg):
-    """Resolve the immutable parent that holds isolated pipeline-run directories."""
+    """Resolve persistent runs away from home when shared DATA_DIR is available."""
     configured = cfg.pipeline.get("runs_dir")
-    # ``manifest_dir`` is retained as a compatibility fallback for older
-    # experiment configs and minimal unit-test fixtures.
-    return Path(str(configured if configured is not None else cfg.pipeline.manifest_dir))
+    if configured:
+        return Path(str(configured))
+    environment = os.environ.get("PIPELINE_RUNS_DIR")
+    if environment:
+        return Path(environment)
+    data_dir = cfg.get("data_dir")
+    if data_dir:
+        return Path(str(data_dir)).parent / "baseline_pipeline_runs"
+    legacy = cfg.pipeline.get("manifest_dir")
+    if legacy:
+        return Path(str(legacy))
+    return Path(str(cfg.baseline.output_dir)) / "pipeline_runs"
+
+
+def atomic_write_text(path, text):
+    """Atomically replace a small bookkeeping file without truncating its predecessor."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent,
+            prefix=f".{path.name}.", suffix=".tmp", delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    except BaseException:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise
+    return path
+
+
+def atomic_write_json(path, payload):
+    return atomic_write_text(path, json.dumps(payload, indent=2))
+
+
+def directory_bytes(root):
+    total, seen = 0, set()
+    for path in Path(root).rglob("*"):
+        try:
+            if path.is_file():
+                stat = path.stat()
+                identity = (stat.st_dev, stat.st_ino)
+                if identity not in seen:
+                    seen.add(identity); total += stat.st_size
+        except OSError:
+            continue
+    return total
+
+
+def storage_bytes_by_suffix(root):
+    totals, seen = {}, set()
+    for path in Path(root).rglob("*"):
+        try:
+            if path.is_file():
+                stat = path.stat()
+                identity = (stat.st_dev, stat.st_ino)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                suffix = path.suffix.lower() or "[no suffix]"
+                totals[suffix] = totals.get(suffix, 0) + stat.st_size
+        except OSError:
+            continue
+    return dict(sorted(totals.items(), key=lambda item: item[1], reverse=True))
+
+
+def check_storage_budget(cfg, run_dir):
+    used = directory_bytes(run_dir)
+    settings = cfg.pipeline.get("storage", {}) or {}
+    warning = float(settings.get("warn_run_gb", 0.0)) * (1024 ** 3)
+    maximum = float(settings.get("max_run_gb", 0.0)) * (1024 ** 3)
+    if maximum > 0 and used > maximum:
+        raise RuntimeError(
+            f"Pipeline run exceeded pipeline.storage.max_run_gb: {used / 1024 ** 3:.2f} GiB "
+            f"under {run_dir}."
+        )
+    if warning > 0 and used > warning:
+        print(f"Warning: pipeline run uses {used / 1024 ** 3:.2f} GiB under {run_dir}.")
+    return used
 
 
 def configure_run_output_dirs(cfg, pipeline_id, run_dir, runs_parent):
-    """Point all baseline stages at one non-shared pipeline-run directory."""
-    original_target_dir = Path(str(cfg.target_discriminator.output_dir))
-    target_leaf = original_target_dir.name
+    """Point all stages at one variable-scoped pipeline-run tree."""
     OmegaConf.update(cfg, "pipeline.id", pipeline_id, merge=False)
     OmegaConf.update(cfg, "pipeline.run_dir", str(run_dir), force_add=True)
-    # Freeze this interpolation before changing baseline.output_dir so the
-    # resolved per-run config still records the actual common run parent.
     OmegaConf.update(cfg, "pipeline.runs_dir", str(runs_parent), force_add=True)
     OmegaConf.update(cfg, "baseline.output_dir", str(run_dir), merge=False)
-    # Some experiments deliberately override target_discriminator.output_dir
-    # (e.g. an SFNO fine-tuning run). Preserve that final directory name while
-    # moving it under this invocation's isolated root.
-    target_output_dir = Path(run_dir) / target_leaf
-    OmegaConf.update(cfg, "target_discriminator.output_dir", str(target_output_dir), merge=False)
+    output_root = baseline_output_dir(cfg, variables_from_config(cfg))
+    OmegaConf.update(cfg, "pipeline.output_root", str(output_root), force_add=True)
+    OmegaConf.update(cfg, "target_discriminator.output_dir", str(output_root), merge=False)
     input_checkpoint_dir = cfg.pipeline.get("input_checkpoint_dir")
     checkpoint_dir = (
         Path(str(input_checkpoint_dir)) if input_checkpoint_dir is not None
-        else target_output_dir / "models" / "target_discriminators"
+        else output_root / "models" / "target_discriminators"
     )
     OmegaConf.update(cfg, "target_discriminator.checkpoint_dir", str(checkpoint_dir), merge=False)
     if cfg.baseline.get("discriminator") is not None:
         OmegaConf.update(
-            cfg,
-            "baseline.discriminator.checkpoint_dir",
-            str(checkpoint_dir),
-            merge=False,
+            cfg, "baseline.discriminator.checkpoint_dir", str(checkpoint_dir), merge=False,
         )
+    for relative in ("data", "models/target_discriminators", "training", "plots"):
+        (output_root / relative).mkdir(parents=True, exist_ok=True)
 
 
 def selected_stages(cfg):
@@ -140,15 +228,18 @@ def standard_input_paths(cfg):
 
 
 def plot_input_paths(cfg, output_root):
-    paths = [
+    """Return only plot inputs produced by the selected standard-metric run.
+
+    Target-discriminator results are optional: the plotter renders them when
+    present, but standard-only evaluation must not require their CSV.
+    """
+    # Per-anchor SCWD and global-mean distribution diagnostics are optional
+    # enrichment artifacts. The curve CSVs remain sufficient for the main
+    # comparison plots and allow a later plotting-only rerun of older runs.
+    return [
         output_root / "data" / "lead_time.csv",
         output_root / "data" / "corruption_strength.csv",
     ]
-    if bool((baseline_get(cfg, "discriminator", {}) or {}).get("enabled", False)):
-        paths.append(output_root / "data" / "discriminator_reverse_kl.csv")
-    if "scwd" in metric_names_from_config(cfg):
-        paths.append(output_root / "data" / "scwd_anchor_contributions.nc")
-    return paths
 
 
 def changed_plot_paths(output_root, before):
@@ -162,19 +253,52 @@ def plot_bundle_members(paths):
     for path in paths:
         path = Path(path)
         if path.suffix.lower() == ".png":
-            members.extend(member for member in plot_bundle_paths(path) if member.is_file())
+            members.extend(member for member in all_plot_bundle_paths(path) if member.is_file())
         elif path.is_file():
             members.append(path)
     return list(dict.fromkeys(members))
 
 
 def run_stage(stage, cfg, tracker, output_root, resolved_path):
+    if temporal_resampling_enabled(cfg) and active_schedule(cfg) is None:
+        resampled = run_resampled_stage(stage, cfg, tracker, output_root, resolved_path)
+        if resampled is not None:
+            return resampled
     upload_data = bool(cfg.pipeline.wandb.get("upload_evaluation_data", True))
+    if stage == "fit_histogram_matching":
+        with tracker.run("preprocessing/histogram-matching", "histogram-matching", cfg, tags=["preprocessing", "histogram-matching"]) as run:
+            paths = fit_histogram_matching_maps(cfg)
+            if paths:
+                summary = next((Path(path) for path in paths if Path(path).name == "fit_summary.csv"),
+                               output_root / "data" / "preprocessing" / "histogram_matching" / "fit_summary.csv")
+                tracker.log_csv_table(run, "histogram_matching/maps", summary)
+                if upload_data:
+                    tracker.log_artifact(run, "histogram-matching", "preprocessing", [*paths, resolved_path], metadata={"pipeline_id": tracker.group})
+            run.summary["histogram_matching/enabled"] = bool((cfg.get("histogram_matching", {}) or {}).get("enabled", False))
+            return [str(path) for path in paths], [{"run_url": getattr(run, "url", None)}]
+    if stage == "fit_moment_matching":
+        with tracker.run("preprocessing/moment-matching", "moment-matching", cfg,
+                         tags=["preprocessing", "moment-matching"]) as run:
+            paths = fit_moment_matching_maps(cfg)
+            if paths:
+                summary = next((Path(path) for path in paths if Path(path).name == "fit_summary.csv"),
+                               output_root / "data" / "preprocessing" / "moment_matching" / "fit_summary.csv")
+                tracker.log_csv_table(run, "moment_matching/maps", summary)
+                if upload_data:
+                    tracker.log_artifact(
+                        run, "moment-matching", "preprocessing", [*paths, resolved_path],
+                        metadata={"pipeline_id": tracker.group},
+                    )
+            run.summary["moment_matching/enabled"] = bool(
+                (cfg.get("moment_matching", {}) or {}).get("enabled", False)
+            )
+            return [str(path) for path in paths], [{"run_url": getattr(run, "url", None)}]
     if stage == "train_discriminators":
         require_files([cfg.real_nc_file], stage)
         records = train_target_discriminator_baselines(cfg, tracker=tracker)
         summary_path = Path(str(cfg.target_discriminator.output_dir)) / "data" / "target_train_test_metrics.csv"
         cases_path = Path(str(cfg.target_discriminator.output_dir)) / "data" / "target_interpretability_cases.csv"
+        split_path = Path(str(cfg.target_discriminator.output_dir)) / "data" / "split_manifest.csv.gz"
         with tracker.run("training/summary", "discriminator-training-summary", cfg, tags=["training", "summary"]) as run:
             tracker.log_csv_table(run, "metrics/target_train_test", summary_path)
             tracker.log_csv_table(run, "interpretability/cases", cases_path)
@@ -182,8 +306,9 @@ def run_stage(stage, cfg, tracker, output_root, resolved_path):
                 run.summary["metrics/target_train_test_rows"] = csv_row_count(summary_path)
             if cases_path.is_file():
                 run.summary["interpretability/case_rows"] = csv_row_count(cases_path)
-                if upload_data:
-                    tracker.log_artifact(run, "target-train-test-metrics", "evaluation", [summary_path, cases_path, resolved_path])
+            if upload_data:
+                training_data = [path for path in (summary_path, cases_path, split_path, resolved_path) if path.is_file()]
+                tracker.log_artifact(run, "target-train-test-metrics", "evaluation", training_data)
         paths = [record["path"] for record in records]
         paths.extend(record["interpretability_gallery"] for record in records
                      if record.get("interpretability_gallery"))
@@ -193,6 +318,8 @@ def run_stage(stage, cfg, tracker, output_root, resolved_path):
             paths.append(str(summary_path))
         if cases_path.is_file():
             paths.append(str(cases_path))
+        if split_path.is_file():
+            paths.append(str(split_path))
         return [str(path) for path in plot_bundle_members(paths)], records
 
     if stage == "evaluate_standard_metrics":
@@ -216,6 +343,8 @@ def run_stage(stage, cfg, tracker, output_root, resolved_path):
             return [str(path) for path in plot_bundle_members(paths)], [{"run_url": getattr(run, "url", None)}]
 
     if stage == "evaluate_mmd_global_moment_matching":
+        if matching_mode(cfg) != "none":
+            raise ValueError("Pipeline-wide fake matching cannot be composed with the separate MMD global-moment diagnostic.")
         require_files(standard_input_paths(cfg), stage)
         with tracker.run("evaluation/mmd-global-moment-matching", "mmd-global-moment-matching", cfg,
                          tags=["evaluation", "mmd", "global-moment-matching"]) as run:
@@ -362,10 +491,34 @@ def run_stage(stage, cfg, tracker, output_root, resolved_path):
 
 
 def execute_pipeline(cfg):
+    configure_plot_bundle_saving_from_cfg(cfg)
     pipeline_id = safe_pipeline_id = str(cfg.pipeline.id or generated_pipeline_id())
     # Keep local directory names portable and exactly aligned with W&B names.
     pipeline_id = safe_name(pipeline_id)
     stages = selected_stages(cfg)
+    matching_mode(cfg)  # Validate mutually exclusive preprocessing modes.
+    histogram_enabled = bool((cfg.get("histogram_matching", {}) or {}).get("enabled", False))
+    if (histogram_enabled and "fit_histogram_matching" not in stages
+            and not (temporal_resampling_enabled(cfg) and active_schedule(cfg) is None)):
+        input_maps = cfg.pipeline.get("input_histogram_matching_dir")
+        if input_maps is None:
+            raise ValueError(
+                "Histogram matching is enabled without fit_histogram_matching; "
+                "set pipeline.input_histogram_matching_dir to an existing fitted artifact."
+            )
+        require_files([Path(str(input_maps)) / "maps.npz",
+                       Path(str(input_maps)) / "manifest.json"], "histogram_matching")
+    moments_enabled = bool((cfg.get("moment_matching", {}) or {}).get("enabled", False))
+    if (moments_enabled and "fit_moment_matching" not in stages
+            and not (temporal_resampling_enabled(cfg) and active_schedule(cfg) is None)):
+        input_maps = cfg.pipeline.get("input_moment_matching_dir")
+        if input_maps is None:
+            raise ValueError(
+                "Moment matching is enabled without fit_moment_matching; "
+                "set pipeline.input_moment_matching_dir to an existing fitted artifact."
+            )
+        require_files([Path(str(input_maps)) / "moments.npz",
+                       Path(str(input_maps)) / "manifest.json"], "moment_matching")
     runs_parent = pipeline_runs_dir(cfg)
     run_dir = runs_parent / pipeline_id
     resume = bool(cfg.pipeline.get("resume", False))
@@ -378,14 +531,25 @@ def execute_pipeline(cfg):
     configure_run_output_dirs(cfg, pipeline_id, run_dir, runs_parent)
     resolved_path = run_dir / "resolved_config.yaml"
     manifest_path = run_dir / "manifest.json"
-    OmegaConf.save(cfg, resolved_path, resolve=True)
+    atomic_write_text(resolved_path, OmegaConf.to_yaml(cfg, resolve=True))
     tracker = PipelineTracker(cfg, pipeline_id)
     variables = variables_from_config(cfg)
     output_root = baseline_output_dir(cfg, variables)
     records = []
+    if resume and manifest_path.is_file():
+        try:
+            records = list(json.loads(manifest_path.read_text()).get("stages", []))
+        except (json.JSONDecodeError, OSError):
+            records = []
     first_error = None
 
     for stage in stages:
+        prior = next((item for item in records if item.get("stage") == stage), None)
+        prior_outputs = [] if prior is None else list(prior.get("outputs", []))
+        if (resume and prior is not None and prior.get("status") == "completed"
+                and all(Path(str(path)).is_file() for path in prior_outputs)):
+            print(f"Skipping completed pipeline stage {stage}")
+            continue
         started = time.monotonic()
         record = {"stage": stage, "status": "running", "started_at": datetime.now(timezone.utc).isoformat()}
         try:
@@ -398,8 +562,17 @@ def execute_pipeline(cfg):
             )
             first_error = first_error or error
         record["duration_seconds"] = time.monotonic() - started
+        records = [existing for existing in records if existing.get("stage") != stage]
         records.append(record)
-        manifest_path.write_text(json.dumps({"pipeline_id": pipeline_id, "stages": records}, indent=2))
+        try:
+            record["run_bytes"] = check_storage_budget(cfg, run_dir)
+        except RuntimeError as storage_error:
+            record.update(
+                status="failed", storage_error=str(storage_error),
+                error=record.get("error", f"RuntimeError: {storage_error}"),
+            )
+            first_error = first_error or storage_error
+        atomic_write_json(manifest_path, {"pipeline_id": pipeline_id, "stages": records})
         if first_error is not None and bool(cfg.pipeline.get("fail_fast", True)):
             break
 
@@ -408,25 +581,43 @@ def execute_pipeline(cfg):
         "requested_pipeline_id": safe_pipeline_id,
         "run_dir": str(run_dir),
         "status": "failed" if first_error is not None else "completed",
-        "selected_stages": stages,
+        "selected_stages": [record["stage"] for record in records],
         "stages": records,
         "resolved_config": str(resolved_path),
+        "manifest_path": str(manifest_path),
     }
-    manifest_path.write_text(json.dumps(manifest, indent=2))
-    with tracker.run("pipeline-summary", "pipeline-summary", cfg, tags=["summary"]) as run:
-        summary_records = [
-            {
-                "stage": record["stage"], "status": record["status"],
-                "duration_seconds": record["duration_seconds"],
-                "error": record.get("error", ""),
-            }
-            for record in records
-        ]
-        tracker.log_records_table(run, "pipeline/stages", summary_records)
-        run.summary["pipeline/status"] = manifest["status"]
-        run.summary["pipeline/stages_completed"] = sum(r["status"] == "completed" for r in records)
-        run.summary["pipeline/run_dir"] = str(run_dir)
-        tracker.log_artifact(run, "pipeline-manifest", "pipeline", [manifest_path, resolved_path])
+    manifest["run_bytes"] = directory_bytes(run_dir)
+    manifest["storage_bytes_by_suffix"] = storage_bytes_by_suffix(run_dir)
+    atomic_write_json(manifest_path, manifest)
+    if temporal_resampling_enabled(cfg) and active_schedule(cfg) is None:
+        resampling_manifest = finalize_resampling_manifest(cfg)
+        manifest["resampling_manifest"] = str(resampling_manifest)
+        manifest["run_bytes"] = directory_bytes(run_dir)
+        manifest["storage_bytes_by_suffix"] = storage_bytes_by_suffix(run_dir)
+    atomic_write_json(manifest_path, manifest)
+    try:
+        with tracker.run("pipeline-summary", "pipeline-summary", cfg, tags=["summary"]) as run:
+            summary_records = [
+                {
+                    "stage": record["stage"], "status": record["status"],
+                    "duration_seconds": record["duration_seconds"],
+                    "error": record.get("error", ""),
+                }
+                for record in records
+            ]
+            tracker.log_records_table(run, "pipeline/stages", summary_records)
+            run.summary["pipeline/status"] = manifest["status"]
+            run.summary["pipeline/stages_completed"] = sum(r["status"] == "completed" for r in records)
+            run.summary["pipeline/run_dir"] = str(run_dir)
+            run.summary["pipeline/run_bytes"] = manifest["run_bytes"]
+            for suffix, byte_count in manifest["storage_bytes_by_suffix"].items():
+                run.summary[f"pipeline/storage_bytes{suffix}"] = byte_count
+            pipeline_artifacts = [manifest_path, resolved_path]
+            if manifest.get("resampling_manifest"):
+                pipeline_artifacts.append(Path(manifest["resampling_manifest"]))
+            tracker.log_artifact(run, "pipeline-manifest", "pipeline", pipeline_artifacts)
+    finally:
+        tracker.close()
     if first_error is not None:
         raise first_error
     return manifest

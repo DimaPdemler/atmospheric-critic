@@ -5,6 +5,11 @@ from dataclasses import dataclass
 import numpy as np
 import xarray as xr
 
+try:
+    from .temporal_resampling import active_schedule, schedule_mask
+except ImportError:
+    from temporal_resampling import active_schedule, schedule_mask
+
 
 @dataclass(frozen=True)
 class ForecastPair:
@@ -62,7 +67,12 @@ def datetime_mask(values, ranges, days):
 
 def select_era5_split(dataset, cfg, split, coverage="corruption"):
     """Select an ERA5 calendar split without altering the original dataset."""
-    mask = datetime_mask(dataset.time.values, time_ranges(cfg, coverage), day_bounds(cfg, split))
+    schedule = active_schedule(cfg)
+    mask = (
+        schedule_mask(dataset.time.values, schedule, split, time_ranges(cfg, coverage))
+        if schedule is not None else
+        datetime_mask(dataset.time.values, time_ranges(cfg, coverage), day_bounds(cfg, split))
+    )
     return dataset.isel(time=np.flatnonzero(mask))
 
 
@@ -89,7 +99,8 @@ def forecast_pairs(dataset, era5, cfg, split, configured_leads=None):
     hours = lead_hours(dataset)
     permitted_leads = None if configured_leads is None else {int(value) for value in configured_leads}
     ranges = time_ranges(cfg, "model")
-    days = day_bounds(cfg, split)
+    schedule = active_schedule(cfg)
+    days = None if schedule is not None else day_bounds(cfg, split)
     lookup = era5_time_lookup(era5)
     pairs = []
     missing = []
@@ -98,7 +109,10 @@ def forecast_pairs(dataset, era5, cfg, split, configured_leads=None):
         if permitted_leads is not None and lead_hour not in permitted_leads:
             continue
         valid = initialization + np.timedelta64(lead_hour, "h")
-        positions = np.flatnonzero(datetime_mask(valid, ranges, days))
+        positions = np.flatnonzero(
+            schedule_mask(valid, schedule, split, ranges)
+            if schedule is not None else datetime_mask(valid, ranges, days)
+        )
         for forecast_index in positions:
             valid_time = valid[forecast_index]
             era5_index = lookup.get(int(valid_time.astype(np.int64)))

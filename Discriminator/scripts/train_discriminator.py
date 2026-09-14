@@ -1,3 +1,5 @@
+"""Train a ResNet18 or SqueezeNet binary discriminator on ERA5 vs. forecasts."""
+
 import os
 
 import hydra

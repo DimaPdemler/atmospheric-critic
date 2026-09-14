@@ -2,8 +2,32 @@ defaults:
   - target_discriminator_baselines
   - _self_
 
+histogram_matching:
+  enabled: false
+  quantile_knots: 2049
+  max_fit_values_per_variable: 1000000
+  max_fit_fields: 256
+  seed: 0
+
+# Optional leakage-free affine matching of each fake variable's pooled scalar
+# training mean and standard deviation to ERA5. Mutually exclusive with
+# histogram_matching; raw fields remain the default.
+moment_matching:
+  enabled: false
+  max_fit_fields: 1000
+  seed: 0
+
 pipeline:
+  storage:
+    # Heavy online W&B working files live on node-local scratch. Offline runs remain persistent.
+    online_wandb_transient: true
+    transient_root: null
+    canonical_diagnostic_fold: learned_04
+    warn_run_gb: 5.0
+    max_run_gb: 10.0
   stages:
+    - fit_histogram_matching
+    - fit_moment_matching
     - train_discriminators
     - evaluate_standard_metrics
     - evaluate_discriminator_metrics
@@ -11,11 +35,16 @@ pipeline:
   id: null
   # Every invocation writes beneath this parent in an isolated directory named
   # after its pipeline id. Reusing an id requires an explicit resume opt-in.
-  runs_dir: "${baseline.output_dir}/pipeline_runs"
+  # Null resolves via PIPELINE_RUNS_DIR, then beside DATA_DIR at the team root.
+  runs_dir: null
   resume: false
   # Exact existing models/target_discriminators directory to load when this
   # invocation evaluates or plots without training its own critics.
   input_checkpoint_dir: null
+  # Existing data/histogram_matching directory for evaluation-only runs.
+  input_histogram_matching_dir: null
+  # Existing data/moment_matching directory for evaluation-only runs.
+  input_moment_matching_dir: null
   fail_fast: true
   wandb:
     enabled: true

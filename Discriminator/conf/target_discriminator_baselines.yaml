@@ -4,8 +4,11 @@ defaults:
 
 # One discriminator per target source; scores use the reverse-KL critic form.
 target_discriminator:
-  output_dir: "${baseline.output_dir}/2m_temperature"
-  variables: ["2m_temperature"]
+  output_dir: "${baseline.output_dir}/2m_temperature__10m_u_component_of_wind__10m_v_component_of_wind__mean_sea_level_pressure"
+  # Optional read-only source for plot-time checkpoint loading. Training always
+  # writes new checkpoints beneath output_dir.
+  checkpoint_dir: null
+  variables: ${baseline.variables}
   model_name: squeezenet
   pretrained_backbone: true
   train_squeezenet: true
@@ -17,18 +20,31 @@ target_discriminator:
   # pretrained on ERA5 through 2019, so these are not leakage-free temporal
   # holdout results. Set SFNO_REPO or override repo_root explicitly.
   sfno:
-    enabled: true
+    enabled: false
     repo_root: null
     weights_subdir: weights_4fields
     # If enabled, only target_variables come from forecasts/corruptions;
     # all other SFNO input channels are matched ERA5 context.
-    target_variables: ["2m_temperature"]
-    #use_era5_context_for_non_target_fields: false
-    use_era5_context_for_non_target_fields: true
+    target_variables: ${baseline.variables}
+    use_era5_context_for_non_target_fields: false
+    #use_era5_context_for_non_target_fields: true
     embedding_channels: 8
     embedding_resolution: [31, 60]
     pooling: grid
     pool_grid: [7, 8]
+    # Probe training follows the same three-epoch schedule as the CNN targets.
+    epochs: 3
+    # Opt-in finetuning: seventh SFNO block plus its final 34-to-8 projection.
+    unfreeze_final_encoder_stage: false
+    # Required when unfreezing the encoder: choose the sole head whose loss updates it.
+    # Accepted values: linear, mlp.
+    finetune_probe_architecture: null
+    representation_ratio:
+      enabled: true
+      # Match the standard-corruption evaluation budget rather than materializing all ERA5 maps.
+      evaluation_samples: ${baseline.corruption_eval_samples}
+      # Full-resolution block-six maps are evaluated in small batches.
+      batch_size: 8
     mlp_hidden_multiplier: 2.0
     mlp_dropout: 0.1
   device: auto
@@ -42,6 +58,8 @@ target_discriminator:
   max_eval_samples: 0
   interpretability:
     enabled: true
+    # For SFNO probes, also render per-position L2 magnitudes after blocks six and seven.
+    sfno_representation_maps: true
     method: integrated_gradients
     baseline:
       kind: global_training_mean
@@ -49,17 +67,22 @@ target_discriminator:
     internal_batch_size: 8
     random_samples_per_class: 2
     seed: ${target_discriminator.seed}
+    # Keep multi-case galleries practical for local inspection and W&B.
+    figure_dpi: 140
   corruption_power: 2.0
-  corruption_steps: 7
+  # Fake corruption samples are drawn uniformly from the nonzero strengths used
+  # in the held-out corruption curves. Set power_law to restore legacy sampling.
+  corruption_severity_sampling: discrete_uniform
+  # Share the exact discrete grid used by standard corruption-curve plots.
+  corruption_steps: ${baseline.corruption_steps}
   corruption_severity_max: 0.2
   corruption_severity_max_overrides:
     gaussian_blur: 1.0
     pixel_replace: 0.01
-  # Training-only lower bounds; clean samples are always supplied by the real
-  # class.  This keeps power-law blur samples away from the identity regime.
+  # Optional training-only logical-severity bounds. Gaussian blur performs its
+  # own zero-preserving remap onto the useful physical blur range.
   corruption_severity_min: 0.0
-  corruption_severity_min_overrides:
-    gaussian_blur: 0.2
+  corruption_severity_min_overrides: {}
   plot_yscale: linear
   plot_linthresh: 1e-2
   forecast_files: ${baseline.forecast_files}
