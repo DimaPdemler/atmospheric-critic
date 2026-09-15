@@ -1,0 +1,513 @@
+diff --git a/Discriminator/conf/config.yaml b/Discriminator/conf/config.yaml
+index 3fea417..9663b47 100644
+--- a/Discriminator/conf/config.yaml
++++ b/Discriminator/conf/config.yaml
+@@ -180,3 +180,8 @@ comparison_files:
+   "GraphCast": "${data_dir}/graphcast_6steps_surf_1.5deg_2018-01-01_2018-12-31.nc"
+   "IFS HRES": "${data_dir}/ifs_hres_6steps_surf_1.5deg_2018-01-01_2018-12-31.nc"
+   "ERA5 Forecast": "${data_dir}/era5_forecast_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc"
++
++# Optional frozen-encoder embedding front-end (see scripts/embedding_adapter.py).
++# null = raw-field discriminator (unchanged legacy behavior). See
++# conf/embedding_config.yaml for the embedding variant.
++embedding_encoder: null
+diff --git a/Discriminator/scripts/analysis_utils.py b/Discriminator/scripts/analysis_utils.py
+index 2706d06..f2a79ab 100644
+--- a/Discriminator/scripts/analysis_utils.py
++++ b/Discriminator/scripts/analysis_utils.py
+@@ -14,8 +14,10 @@ from tqdm import tqdm
+ 
+ try:
+     from .train_discriminator import WeatherDiscriminator, select_time_ranges
++    from .embedding_adapter import maybe_build_adapter, load_field_stats_sidecar
+ except ImportError:
+     from train_discriminator import WeatherDiscriminator, select_time_ranges
++    from embedding_adapter import maybe_build_adapter, load_field_stats_sidecar
+ 
+ 
+ def resolve_device():
+@@ -27,18 +29,39 @@ def model_weight_path(cfg, variables, *, filename=None):
+     """Return the default `.pth` path produced by `train_discriminator.py`."""
+     if filename is not None:
+         return Path(cfg.output_dir) / filename
++    if cfg.get("output_filename"):
++        return Path(cfg.output_dir) / cfg.output_filename
+ 
+     variable_tag = cfg.get("selected_variable", "all_fields") if len(variables) == 1 else "all_fields"
+     return Path(cfg.output_dir) / f"weather_discriminator_{cfg.model_name}_{variable_tag}_lightning.pth"
+ 
+ 
+-def load_discriminator(cfg, variables, device, *, filename=None):
++def resolve_field_stats(weights_path, cfg, variables, field_stats=None):
++    """Train-time normalization stats: sidecar JSON -> explicit arg -> recompute."""
++    sidecar = load_field_stats_sidecar(weights_path)
++    if sidecar is not None:
++        return sidecar
++    if field_stats is not None:
++        return field_stats
++    import xarray as xr
++
++    with xr.open_dataset(cfg.real_nc_file) as real_ds:
++        return normalization_stats(real_ds, variables, cfg.train_real_range)
++
++
++def load_discriminator(cfg, variables, device, *, filename=None, field_stats=None):
+     """Construct a discriminator and load the saved inner torchvision weights."""
+     path = model_weight_path(cfg, variables, filename=filename)
+     if not path.exists():
+         raise FileNotFoundError(f"Model weights not found: {path}")
+ 
+-    model = WeatherDiscriminator(len(variables), cfg.model_name).to(device)
++    adapter = maybe_build_adapter(cfg, variables)
++    if adapter is not None:
++        means, stds = resolve_field_stats(path, cfg, variables, field_stats)
++        adapter.set_field_stats(means, stds)
++
++    model = WeatherDiscriminator(len(variables), cfg.model_name,
++                                 embedding_adapter=adapter).to(device)
+     model.model.load_state_dict(torch.load(path, map_location=device))
+     model.eval()
+     return model, path
+diff --git a/Discriminator/scripts/evaluate_discriminator.py b/Discriminator/scripts/evaluate_discriminator.py
+index 3c16385..ea7149a 100644
+--- a/Discriminator/scripts/evaluate_discriminator.py
++++ b/Discriminator/scripts/evaluate_discriminator.py
+@@ -12,8 +12,10 @@ from omegaconf import DictConfig
+ import xarray as xr
+ 
+ try:
++    from .embedding_adapter import maybe_build_adapter, load_field_stats_sidecar
+     from .train_discriminator import WeatherDiscriminatorDataset, WeatherDiscriminator, variables_from_config
+ except ImportError:
++    from embedding_adapter import maybe_build_adapter, load_field_stats_sidecar
+     from train_discriminator import WeatherDiscriminatorDataset, WeatherDiscriminator, variables_from_config
+ 
+ 
+@@ -104,6 +106,14 @@ def evaluate_and_visualize(cfg: DictConfig):
+         print(f"Skipping evaluation: missing real variables={missing_real}; missing fake variables={missing_fake}.")
+         return
+ 
++    adapter = maybe_build_adapter(cfg, model_vars)
++    # In embedding mode, normalize the test dataset with the train-time stats
++    # (sidecar) so the adapter's de-normalization is exact.
++    sidecar_stats = load_field_stats_sidecar(model_weights) if adapter is not None else None
++    stats_kwargs = {}
++    if sidecar_stats is not None:
++        stats_kwargs = {"means": sidecar_stats[0], "stds": sidecar_stats[1]}
++
+     test_dataset = WeatherDiscriminatorDataset(
+         real_nc_file, fake_nc_file, model_vars,
+         real_range=cfg.test_real_ranges,
+@@ -112,11 +122,15 @@ def evaluate_and_visualize(cfg: DictConfig):
+         level=cfg.get("level"),
+         balanced=False,
+         disturb_type=cfg.get("disturb_type", None),
+-        disturb_level=cfg.get("disturb_level", 0.0)
++        disturb_level=cfg.get("disturb_level", 0.0),
++        **stats_kwargs,
+     )
+     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+ 
+-    lightning_model = WeatherDiscriminator(num_weather_channels=len(model_vars), model_name=cfg.model_name)
++    if adapter is not None:
++        adapter.set_field_stats(test_dataset.means, test_dataset.stds)
++    lightning_model = WeatherDiscriminator(num_weather_channels=len(model_vars), model_name=cfg.model_name,
++                                           embedding_adapter=adapter)
+     lightning_model.model.load_state_dict(torch.load(model_weights, map_location=device))
+     model = lightning_model.to(device).eval()
+ 
+diff --git a/Discriminator/scripts/plot_logits_vs_corruption_kfold.py b/Discriminator/scripts/plot_logits_vs_corruption_kfold.py
+index 0ee147e..8f76524 100644
+--- a/Discriminator/scripts/plot_logits_vs_corruption_kfold.py
++++ b/Discriminator/scripts/plot_logits_vs_corruption_kfold.py
+@@ -25,6 +25,7 @@ try:
+         select_time_ranges,
+     )
+     from .analysis_utils import normalization_stats, resolve_device
++    from .embedding_adapter import maybe_build_adapter
+     from .train_kfold import variable_tag
+ except ImportError:
+     from corruptions import get_corruption_ladder
+@@ -41,6 +42,7 @@ except ImportError:
+         select_time_ranges,
+     )
+     from analysis_utils import normalization_stats, resolve_device
++    from embedding_adapter import maybe_build_adapter
+     from train_kfold import variable_tag
+ 
+ 
+@@ -144,7 +146,10 @@ def mean_logits(dataset, model, cfg, device):
+ 
+ def evaluate(cfg, real_test_ds, means, stds, model_vars, device):
+     """Evaluate all corruption-fold checkpoints over all corruption strengths."""
+-    model = WeatherDiscriminator(len(model_vars), cfg.model_name).to(device)
++    adapter = maybe_build_adapter(cfg, model_vars)
++    if adapter is not None:
++        adapter.set_field_stats(means, stds)
++    model = WeatherDiscriminator(len(model_vars), cfg.model_name, embedding_adapter=adapter).to(device)
+     max_samples = int(cfg.get("corruption_kfold_eval_samples", 100))
+     corruption_types = corruption_kfold_types(cfg)
+     results = {}
+diff --git a/Discriminator/scripts/plot_logits_vs_disturbance.py b/Discriminator/scripts/plot_logits_vs_disturbance.py
+index c84ad49..b784973 100644
+--- a/Discriminator/scripts/plot_logits_vs_disturbance.py
++++ b/Discriminator/scripts/plot_logits_vs_disturbance.py
+@@ -13,10 +13,12 @@ from omegaconf import DictConfig
+ 
+ try:
+     from .analysis_utils import normalization_stats
+-    from .train_discriminator import WeatherDiscriminator, safe_open_dataset, select_time_ranges
++    from .embedding_adapter import maybe_build_adapter
++    from .train_discriminator import WeatherDiscriminator, safe_open_dataset, select_time_ranges, variables_from_config
+ except ImportError:
+     from analysis_utils import normalization_stats
+-    from train_discriminator import WeatherDiscriminator, safe_open_dataset, select_time_ranges
++    from embedding_adapter import maybe_build_adapter
++    from train_discriminator import WeatherDiscriminator, safe_open_dataset, select_time_ranges, variables_from_config
+ 
+ 
+ # These NumPy disturbances are deliberately separate from `corruptions.py`.
+@@ -151,11 +153,16 @@ def main(cfg: DictConfig):
+     real_ds_global = safe_open_dataset(cfg.test_real_nc_file)
+     test_real_ds = select_time_ranges(real_ds_global, cfg.test_real_ranges)
+ 
+-    model_vars = [cfg.selected_variable]
++    # Embedding encoders consume all configured channels, not one variable.
++    model_vars = variables_from_config(cfg) if cfg.get("embedding_encoder") else [cfg.selected_variable]
+     means, stds = normalization_stats(real_ds_global, model_vars, cfg.train_real_range)
+ 
+-    model = WeatherDiscriminator(len(model_vars), cfg.model_name).to(device)
+-    model_path = os.path.join(cfg.output_dir, f"weather_discriminator_{cfg.model_name}_{cfg.selected_variable}_lightning.pth")
++    adapter = maybe_build_adapter(cfg, model_vars)
++    if adapter is not None:
++        adapter.set_field_stats(means, stds)
++    model = WeatherDiscriminator(len(model_vars), cfg.model_name, embedding_adapter=adapter).to(device)
++    variable_tag = cfg.selected_variable if len(model_vars) == 1 else "all_fields"
++    model_path = os.path.join(cfg.output_dir, f"weather_discriminator_{cfg.model_name}_{variable_tag}_lightning.pth")
+     if not os.path.exists(model_path):
+         raise FileNotFoundError(f"Model weights not found: {model_path}")
+     model.model.load_state_dict(torch.load(model_path, map_location=device))
+diff --git a/Discriminator/scripts/plot_logits_vs_disturbance_kfold.py b/Discriminator/scripts/plot_logits_vs_disturbance_kfold.py
+index 4ffa39c..30f0696 100644
+--- a/Discriminator/scripts/plot_logits_vs_disturbance_kfold.py
++++ b/Discriminator/scripts/plot_logits_vs_disturbance_kfold.py
+@@ -14,6 +14,7 @@ from omegaconf import DictConfig
+ try:
+     from .analysis_utils import normalization_stats
+     from .corruptions import get_corruption_ladder
++    from .embedding_adapter import maybe_build_adapter
+     from .train_discriminator import (
+         WeatherDiscriminator,
+         apply_configured_corruption,
+@@ -23,6 +24,7 @@ try:
+ except ImportError:
+     from analysis_utils import normalization_stats
+     from corruptions import get_corruption_ladder
++    from embedding_adapter import maybe_build_adapter
+     from train_discriminator import (
+         WeatherDiscriminator,
+         apply_configured_corruption,
+@@ -202,8 +204,11 @@ def main(cfg: DictConfig):
+     if not disturbances:
+         raise ValueError("No valid disturbances configured for k-fold plotting.")
+ 
+-    model = WeatherDiscriminator(len(model_vars), cfg.model_name).to(device)
+-    
++    adapter = maybe_build_adapter(cfg, model_vars)
++    if adapter is not None:
++        adapter.set_field_stats(means, stds)
++    model = WeatherDiscriminator(len(model_vars), cfg.model_name, embedding_adapter=adapter).to(device)
++
+     # Evaluate only holdout/full-pool discriminator weights produced by
+     # `train_kfold.py`.
+     model_files = kfold_checkpoint_files(cfg)
+diff --git a/Discriminator/scripts/plot_logits_vs_lead_time.py b/Discriminator/scripts/plot_logits_vs_lead_time.py
+index 1290396..a39452b 100644
+--- a/Discriminator/scripts/plot_logits_vs_lead_time.py
++++ b/Discriminator/scripts/plot_logits_vs_lead_time.py
+@@ -21,7 +21,7 @@ try:
+         normalization_stats,
+         resolve_device,
+     )
+-    from .train_discriminator import select_time_ranges
++    from .train_discriminator import select_time_ranges, variables_from_config
+ except ImportError:
+     from analysis_utils import (
+         LeadTimeInferenceDataset,
+@@ -30,7 +30,7 @@ except ImportError:
+         normalization_stats,
+         resolve_device,
+     )
+-    from train_discriminator import select_time_ranges
++    from train_discriminator import select_time_ranges, variables_from_config
+ 
+ 
+ def plot_curve(label, lead_hours, means, stds):
+@@ -49,13 +49,16 @@ def plot_curve(label, lead_hours, means, stds):
+ def main(cfg: DictConfig):
+     """Plot one discriminator's mean logits over lead time for comparison files."""
+     device = resolve_device()
+-    model_vars = [cfg.selected_variable]
++    # Embedding encoders consume all configured channels, not one variable.
++    # ++plot_all_fields=true does the same for raw all-fields checkpoints.
++    use_all_fields = cfg.get("embedding_encoder") or cfg.get("plot_all_fields", False)
++    model_vars = variables_from_config(cfg) if use_all_fields else [cfg.selected_variable]
+ 
+     real_ds = xr.open_dataset(cfg.test_real_nc_file)
+     real_test_ds = select_time_ranges(real_ds, cfg.test_real_ranges)
+     means, stds = normalization_stats(real_ds, model_vars, cfg.train_real_range)
+ 
+-    model, model_path = load_discriminator(cfg, model_vars, device)
++    model, model_path = load_discriminator(cfg, model_vars, device, field_stats=(means, stds))
+     print(f"Loaded discriminator: {model_path}")
+ 
+     plt.figure(figsize=(10, 6))
+diff --git a/Discriminator/scripts/plot_logits_vs_lead_time_kfold.py b/Discriminator/scripts/plot_logits_vs_lead_time_kfold.py
+index 9da2270..3811e4a 100644
+--- a/Discriminator/scripts/plot_logits_vs_lead_time_kfold.py
++++ b/Discriminator/scripts/plot_logits_vs_lead_time_kfold.py
+@@ -22,6 +22,7 @@ try:
+         normalization_stats,
+         resolve_device,
+     )
++    from .embedding_adapter import maybe_build_adapter
+     from .train_discriminator import WeatherDiscriminator, safe_open_dataset, select_time_ranges
+ except ImportError:
+     from analysis_utils import (
+@@ -30,6 +31,7 @@ except ImportError:
+         normalization_stats,
+         resolve_device,
+     )
++    from embedding_adapter import maybe_build_adapter
+     from train_discriminator import WeatherDiscriminator, safe_open_dataset, select_time_ranges
+ 
+ 
+@@ -146,7 +148,10 @@ def main(cfg: DictConfig):
+         real_test_ds = select_time_ranges(real_ds, cfg.train_real_range)
+     means, stds = normalization_stats(real_ds, model_vars, cfg.train_real_range)
+ 
+-    model = WeatherDiscriminator(len(model_vars), cfg.model_name).to(device)
++    adapter = maybe_build_adapter(cfg, model_vars)
++    if adapter is not None:
++        adapter.set_field_stats(means, stds)
++    model = WeatherDiscriminator(len(model_vars), cfg.model_name, embedding_adapter=adapter).to(device)
+     era5_dataset = LeadTimeInferenceDataset(real_test_ds, model_vars, means, stds, level=cfg.get("level"))
+     ml_datasets, numerical_datasets, max_lead_hour = load_comparison_datasets(cfg, model_vars, means, stds)
+ 
+diff --git a/Discriminator/scripts/plot_logits_vs_lead_time_temporal_holdout.py b/Discriminator/scripts/plot_logits_vs_lead_time_temporal_holdout.py
+index 39870e2..24b5aef 100644
+--- a/Discriminator/scripts/plot_logits_vs_lead_time_temporal_holdout.py
++++ b/Discriminator/scripts/plot_logits_vs_lead_time_temporal_holdout.py
+@@ -11,10 +11,12 @@ import torch
+ try:
+     from .analysis_utils import LeadTimeInferenceDataset, mean_logits_by_lead, normalization_stats, resolve_device
+     from .temporal_holdout_utils import checkpoint_path, discover_temporal_pairs, safe_model_name, variable_tag, variables_from_config
++    from .embedding_adapter import maybe_build_adapter
+     from .train_discriminator import WeatherDiscriminator, safe_open_dataset, select_time_ranges
+ except ImportError:
+     from analysis_utils import LeadTimeInferenceDataset, mean_logits_by_lead, normalization_stats, resolve_device
+     from temporal_holdout_utils import checkpoint_path, discover_temporal_pairs, safe_model_name, variable_tag, variables_from_config
++    from embedding_adapter import maybe_build_adapter
+     from train_discriminator import WeatherDiscriminator, safe_open_dataset, select_time_ranges
+ 
+ 
+@@ -64,7 +66,10 @@ def main(cfg: DictConfig):
+     real_test_ds = select_time_ranges(real_ds, cfg.test_real_ranges)
+     means, stds = normalization_stats(real_ds, model_vars, cfg.train_real_range)
+ 
+-    model = WeatherDiscriminator(len(model_vars), cfg.model_name).to(device)
++    adapter = maybe_build_adapter(cfg, model_vars)
++    if adapter is not None:
++        adapter.set_field_stats(means, stds)
++    model = WeatherDiscriminator(len(model_vars), cfg.model_name, embedding_adapter=adapter).to(device)
+     era5_dataset = LeadTimeInferenceDataset(
+         real_test_ds,
+         model_vars,
+diff --git a/Discriminator/scripts/plot_poster_dist_severity.py b/Discriminator/scripts/plot_poster_dist_severity.py
+index b13314d..13628cc 100644
+--- a/Discriminator/scripts/plot_poster_dist_severity.py
++++ b/Discriminator/scripts/plot_poster_dist_severity.py
+@@ -23,6 +23,7 @@ from torch.utils.data import DataLoader, Dataset
+ 
+ try:
+     from .corruptions import apply_high_freq_noise, apply_wind_channel_rotation
++    from .embedding_adapter import maybe_build_adapter, load_field_stats_sidecar
+     from .train_discriminator import (
+         WeatherDiscriminator,
+         safe_open_dataset,
+@@ -31,6 +32,7 @@ try:
+     )
+ except ImportError:
+     from corruptions import apply_high_freq_noise, apply_wind_channel_rotation
++    from embedding_adapter import maybe_build_adapter, load_field_stats_sidecar
+     from train_discriminator import (
+         WeatherDiscriminator,
+         safe_open_dataset,
+@@ -239,9 +241,8 @@ def reverse_kl_score(model, dataset, real_term, real_term_stderr, batch_size, nu
+     return score, stderr
+ 
+ 
+-def load_model(cfg, variables, device, model_path=None):
++def load_model(cfg, variables, device, model_path=None, field_stats=None):
+     """Load the saved discriminator weights into a freshly constructed model."""
+-    model = WeatherDiscriminator(len(variables), cfg.model_name).to(device)
+     variable_tag = cfg.get("selected_variable", "all_fields") if len(variables) == 1 else "all_fields"
+     if model_path is None:
+         model_path = Path(cfg.output_dir) / f"weather_discriminator_{cfg.model_name}_{variable_tag}_lightning.pth"
+@@ -249,6 +250,19 @@ def load_model(cfg, variables, device, model_path=None):
+         model_path = Path(model_path)
+     if not model_path.exists():
+         raise FileNotFoundError(f"Model weights not found: {model_path}")
++
++    adapter = maybe_build_adapter(cfg, variables)
++    if adapter is not None:
++        stats = load_field_stats_sidecar(model_path) or field_stats
++        if stats is None:
++            raise ValueError(
++                f"embedding mode needs train-time stats: no sidecar at {model_path}.stats.json "
++                "and no field_stats passed"
++            )
++        adapter.set_field_stats(*stats)
++
++    model = WeatherDiscriminator(len(variables), cfg.model_name,
++                                 embedding_adapter=adapter).to(device)
+     model.model.load_state_dict(torch.load(model_path, map_location=device))
+     model.eval()
+     return model, model_path
+@@ -338,7 +352,8 @@ def compute_curves(args, cfg):
+     real_ds = select_time_ranges(safe_open_dataset(real_path), cfg.test_real_ranges)
+     real_ds, real_lead_index = select_zero_lead(real_ds)
+     means, stds = stats_from_real(safe_open_dataset(real_path), variables, cfg.train_real_range)
+-    model, model_path = load_model(cfg, variables, device, graphcast_model_path)
++    model, model_path = load_model(cfg, variables, device, graphcast_model_path,
++                                   field_stats=(means, stds))
+ 
+     print(f"Device: {device}")
+     print(f"Model:  {model_path}")
+@@ -397,7 +412,8 @@ def compute_curves(args, cfg):
+             forecast_results[label] = curve
+ 
+     if pangu_model_path.exists():
+-        pangu_model, loaded_pangu_model_path = load_model(cfg, variables, device, pangu_model_path)
++        pangu_model, loaded_pangu_model_path = load_model(cfg, variables, device, pangu_model_path,
++                                                          field_stats=(means, stds))
+         print(f"Pangu holdout model: {loaded_pangu_model_path}")
+         pangu_real_term, pangu_real_term_stderr = compute_real_term(
+             pangu_model,
+diff --git a/Discriminator/scripts/train_discriminator.py b/Discriminator/scripts/train_discriminator.py
+index c73f4ba..3620ba4 100644
+--- a/Discriminator/scripts/train_discriminator.py
++++ b/Discriminator/scripts/train_discriminator.py
+@@ -1,3 +1,4 @@
++import json
+ import os
+ 
+ import hydra
+@@ -33,6 +34,11 @@ except ImportError:
+         apply_wind_patch_shuffle,
+     )
+ 
++try:
++    from .embedding_adapter import maybe_build_adapter
++except ImportError:
++    from embedding_adapter import maybe_build_adapter
++
+ try:
+     from dotenv import load_dotenv
+ except ImportError:
+@@ -555,12 +561,19 @@ class WeatherDiscriminatorDataset(Dataset):
+ class WeatherDiscriminator(L.LightningModule):
+     """Torchvision backbone adapted for weather-field binary classification."""
+ 
+-    def __init__(self, num_weather_channels, model_name="resnet18", learning_rate=1e-4):
++    def __init__(self, num_weather_channels, model_name="resnet18", learning_rate=1e-4,
++                 embedding_adapter=None):
+         super().__init__()
+-        self.save_hyperparameters()
++        self.save_hyperparameters(ignore=["embedding_adapter"])
+         self.learning_rate = learning_rate
+         self.model_name = model_name
+-        
++        # Optional frozen encoder front-end (see embedding_adapter.py). When set,
++        # the backbone sees (B, adapter.out_channels, 121, 240) embeddings instead
++        # of raw fields; the backbone architecture itself is unchanged.
++        self.encoder_adapter = embedding_adapter
++        if embedding_adapter is not None:
++            num_weather_channels = embedding_adapter.out_channels
++
+         if model_name == "resnet18":
+             self.model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+             old_conv = self.model.conv1
+@@ -590,12 +603,27 @@ class WeatherDiscriminator(L.LightningModule):
+             old_classifier = self.model.classifier[1]
+             self.model.classifier[1] = nn.Conv2d(old_classifier.in_channels, 1, kernel_size=(1, 1))
+             self.model.classifier[2] = nn.Identity()
++        elif model_name == "linear":
++            # Capacity-controlled per-position linear readout (logistic regression
++            # over the flattened input). Intended for frozen-embedding inputs where
++            # a translation-equivariant CNN cannot express the position-coded
++            # signal. The non-affine BatchNorm reproduces the per-dimension
++            # standardization the linear probe requires; its running stats live in
++            # the checkpoint, so save/load needs no extra machinery. Lazy modules
++            # infer the input width at the first forward (or from a checkpoint).
++            self.model = nn.Sequential(
++                nn.Flatten(1),
++                nn.LazyBatchNorm1d(affine=False),
++                nn.LazyLinear(1),
++            )
+         else:
+             raise ValueError(f"Unsupported model: {model_name}")
+             
+         self.criterion = nn.BCEWithLogitsLoss()
+ 
+     def forward(self, x):
++        if self.encoder_adapter is not None:
++            x = self.encoder_adapter(x)
+         out = self.model(x)
+         if self.model_name == "squeezenet":
+             out = torch.flatten(out, 1)
+@@ -611,7 +639,9 @@ class WeatherDiscriminator(L.LightningModule):
+         return loss
+ 
+     def configure_optimizers(self):
+-        return optim.AdamW(self.parameters(), lr=self.learning_rate)
++        # The frozen encoder adapter (if any) contributes no trainable params.
++        params = (p for p in self.parameters() if p.requires_grad)
++        return optim.AdamW(params, lr=self.learning_rate)
+ 
+ @hydra.main(version_base=None, config_path="../conf", config_name="config")
+ def main(cfg: DictConfig):
+@@ -638,11 +668,16 @@ def main(cfg: DictConfig):
+         max_samples=cfg.get("max_samples", 0),
+     )
+     dataloader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers)
+-    
++
++    adapter = maybe_build_adapter(cfg, vars_to_use)
++    if adapter is not None:
++        adapter.set_field_stats(dataset.means, dataset.stds)
++
+     model = WeatherDiscriminator(
+-        num_weather_channels=len(vars_to_use), 
+-        model_name=cfg.model_name, 
+-        learning_rate=cfg.learning_rate
++        num_weather_channels=len(vars_to_use),
++        model_name=cfg.model_name,
++        learning_rate=cfg.learning_rate,
++        embedding_adapter=adapter,
+     )
+     
+     trainer = L.Trainer(
+@@ -659,6 +694,12 @@ def main(cfg: DictConfig):
+     output_filename = cfg.get("output_filename", f"weather_discriminator_{cfg.model_name}_{variable_tag}_lightning.pth")
+     save_path = os.path.join(cfg.output_dir, output_filename)
+     torch.save(model.model.state_dict(), save_path)
++    # Stats sidecar: the exact train-time normalization stats, so eval scripts
++    # (and the embedding adapter's de-normalization) reproduce inputs exactly
++    # even when max_samples subsampling shifted the recomputed stats.
++    with open(save_path + ".stats.json", "w") as f:
++        json.dump({"means": dataset.means, "stds": dataset.stds,
++                   "variables": list(vars_to_use)}, f)
+     print(f"Weights saved to {save_path}")
+ 
+ if __name__ == "__main__":

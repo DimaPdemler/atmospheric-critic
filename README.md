@@ -30,6 +30,24 @@ synthetically corrupted fields. The raw classifier logit serves as the realism s
 Refer to [`Discriminator/README.md`](Discriminator/README.md) for the full pipeline
 and configuration options.
 
+### Explored alternative: self-supervised feature embeddings
+
+See [`FeatureMetric/`](FeatureMetric/). This direction was explored and then set aside in
+favour of the discriminator; the code is kept on this branch for reference.
+
+Two self-supervised encoders, a Masked Autoencoder (MAE) and I-JEPA, are trained on ERA5 without
+labels. Realism is then measured in the encoders' latent space rather than from a trained
+classifier:
+
+- Protocol 1 (linear probe): regress corruption severity from frozen latents and report R-squared.
+- Protocol 2 (distribution distance): Frechet Distance and Maximum Mean Discrepancy between a clean
+  reference latent distribution and corrupted or forecast distributions across a severity ladder.
+- Temporal variants (`none`, `diff`, `concat`, `phase`) inject time-difference dynamics so the
+  metric can react to forecast-specific artifacts rather than static state alone.
+- An SFNO encoder wrapper and a shelved embedding-adapter discriminator
+  ([`FeatureMetric/shelved/`](FeatureMetric/shelved/discriminator_embedding_adapter/README.md))
+  feed frozen encoder tokens into the discriminator instead of raw fields.
+
 ## Repository layout
 
 ```
@@ -37,7 +55,7 @@ and configuration options.
 ├── Discriminator/     discriminator pipeline (training, evaluation, plotting)
 ├── download/          data-download utilities (ERA5 and forecasts from WeatherBench2)
 ├── ucast/             UCast forecast postprocessing and evaluation
-├── FeatureMetric/     SWIFT data conversion utilities
+├── FeatureMetric/     self-supervised encoder direction (MAE, I-JEPA, SFNO; explored)
 ├── environment.yml
 ├── .gitignore
 └── README.md
@@ -74,3 +92,4 @@ See [`Discriminator/README.md`](Discriminator/README.md) for pipeline-specific u
 |------|----------|
 | Train or evaluate the discriminator | [`Discriminator/README.md`](Discriminator/README.md) |
 | Download ERA5 or forecast data | [`download/`](download/) |
+| Explore the MAE / I-JEPA feature-embedding direction | [`FeatureMetric/README.md`](FeatureMetric/README.md) |

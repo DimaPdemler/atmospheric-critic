@@ -1,0 +1,47 @@
+# Embedding-discriminator variant: identical SqueezeNet + training pipeline,
+# but inputs pass through a frozen FeatureMetric encoder first
+# (scripts/embedding_adapter.py). Surface 4-var only — the encoders were
+# trained on [T2M, U10, V10, MSL] and cannot consume other variable sets.
+#
+# Default encoder: SFNO — the Phase-A probe winner (frozen-token logistic AUC
+# 0.845 Pangu / 0.856 GraphCast vs spectral baseline 0.865 / 0.795).
+# Alternatives: name=ijepa (2nd best), name=mae (weakest; ablation only).
+defaults:
+  - config
+  - _self_
+
+featuremetric_dir: ${oc.env:FEATUREMETRIC_DIR,../FeatureMetric}
+
+embedding_encoder:
+  # mae | ijepa | sfno
+  name: sfno
+  # Checkpoint for mae/ijepa (ignored by sfno):
+  #   mae   -> ${featuremetric_dir}/checkpoints/best_mae_model_twin.pth
+  #   ijepa -> ${featuremetric_dir}/checkpoints/best_ijepa_model_tiny.pth
+  checkpoint: ${featuremetric_dir}/checkpoints/best_mae_model_twin.pth
+  # FeatureMetric normalization stats (data_mean.npy / data_std.npy).
+  stats_dir: ${featuremetric_dir}/checkpoints
+  featuremetric_dir: ${featuremetric_dir}
+  # SFNO-specific settings (used only when name=sfno). repo_root null resolves
+  # via $SFNO_REPO or the sibling SFNO-Embedding checkout.
+  sfno:
+    repo_root: null
+    embedding_channels: 8
+    embedding_resolution: [31, 60]
+
+# Paper split convention: train fakes 2018 (Pangu/GraphCast), train ERA5
+# 2008-2018; test fakes 2020 (all models), test ERA5 2004-2007 + 2019-2023.
+# 2020 is never trained on (overrides the base config's swapped poster split).
+train_real_range:
+  - ["2008-01-01", "2018-12-31"]
+train_fake_range: ["2018-01-01", "2018-12-31"]
+test_real_ranges:
+  - ["2004-01-01", "2007-12-31"]
+  - ["2019-01-01", "2023-12-31"]
+test_fake_range: ["2020-01-01", "2020-12-31"]
+
+fake_nc_file:
+  - "${data_dir}/pangu_6steps_surf_1.5deg_2018-01-01_2018-12-31.nc"
+  - "${data_dir}/graphcast_6steps_surf_1.5deg_2018-01-01_2018-12-31.nc"
+
+output_filename: "weather_discriminator_embedding_${embedding_encoder.name}_${model_name}_all_fields_lightning.pth"
